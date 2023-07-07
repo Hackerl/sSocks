@@ -5,6 +5,10 @@
 #include <zero/log.h>
 #include <zero/cmdline.h>
 
+#ifdef __unix__
+#include <csignal>
+#endif
+
 std::shared_ptr<zero::async::promise::Promise<std::vector<aio::net::Address>>> resolve(
         const std::shared_ptr<aio::Context> &context,
         const Target &target
@@ -59,26 +63,33 @@ std::shared_ptr<zero::async::promise::Promise<std::vector<aio::net::Address>>> r
         }
     }
 
-    return promise;
+    return promise->fail(
+            PF_RETHROW(
+                    ADDRESS_RESOLVE_ERROR,
+                    zero::strings::format("resolve target %s failed", stringify(target).c_str())
+            )
+    );
 }
 
 std::shared_ptr<zero::async::promise::Promise<void>> proxyUDP(
         const std::shared_ptr<aio::Context> &context,
         const zero::ptr::RefPtr<aio::net::stream::IBuffer> &local
 ) {
-    return readTarget(local)->then([=](const Target &target) {
-        LOG_INFO("UDP proxy: %s", stringify(target).c_str());
+    std::optional<aio::net::Address> clientAddress = local->remoteAddress();
 
+    if (!clientAddress)
+        return zero::async::promise::reject<void>(
+                {aio::IO_ERROR, zero::strings::format("failed to get remote address[%s]", aio::lastError().c_str())}
+        );
+
+    return readTarget(local)->then([=](const Target &target) {
         return local->readExactly(4)->then([=](nonstd::span<const std::byte> data) {
             return local->readExactly(ntohl(*(uint32_t *) data.data()));
         })->then([=](nonstd::span<const std::byte> data) {
-            return resolve(
-                    context,
-                    target
-            )->then([
-                            =,
-                            payload = std::vector<std::byte>{data.begin(), data.end()}
-                    ](nonstd::span<const aio::net::Address> addresses) {
+            return resolve(context, target)->then([
+                                                          =,
+                                                          payload = std::vector<std::byte>{data.begin(), data.end()}
+                                                  ](nonstd::span<const aio::net::Address> addresses) {
                 const aio::net::Address &address = addresses.front();
 
                 zero::ptr::RefPtr<aio::net::dgram::Socket> remote = aio::net::dgram::bind(
@@ -88,15 +99,25 @@ std::shared_ptr<zero::async::promise::Promise<void>> proxyUDP(
                 );
 
                 if (!remote)
-                    return zero::async::promise::reject<void>({-1, "bind failed"});
+                    return zero::async::promise::reject<void>(
+                            {
+                                    aio::IO_ERROR,
+                                    zero::strings::format("create datagram socket failed[%s]", aio::lastError().c_str())
+                            }
+                    );
+
+                LOG_INFO(
+                        "UDP packet[%llu]: %s ==> %s",
+                        payload.size(),
+                        stringify(*clientAddress).c_str(),
+                        stringify(target).c_str()
+                );
 
                 return remote->writeTo(payload, address)->then([=]() {
                     return zero::async::promise::all(
-                            zero::async::promise::loop<void>([=](const auto &loop) {
-                                readTarget(local)->then([=](const Target &target) {
-                                    LOG_INFO("UDP proxy: %s", stringify(target).c_str());
-
-                                    local->readExactly(4)->then([=](nonstd::span<const std::byte> data) {
+                            zero::async::promise::doWhile([=]() {
+                                return readTarget(local)->then([=](const Target &target) {
+                                    return local->readExactly(4)->then([=](nonstd::span<const std::byte> data) {
                                         return local->readExactly(ntohl(*(uint32_t *) data.data()));
                                     })->then([=](nonstd::span<const std::byte> data) {
                                         return resolve(
@@ -106,40 +127,50 @@ std::shared_ptr<zero::async::promise::Promise<void>> proxyUDP(
                                                         =,
                                                         payload = std::vector<std::byte>{data.begin(), data.end()}
                                                 ](nonstd::span<const aio::net::Address> addresses) {
+                                            LOG_INFO(
+                                                    "UDP packet[%llu]: %s ==> %s",
+                                                    payload.size(),
+                                                    stringify(*clientAddress).c_str(),
+                                                    stringify(target).c_str()
+                                            );
+
                                             return remote->writeTo(payload, addresses.front());
                                         });
                                     });
-                                })->then([=]() {
-                                    P_CONTINUE(loop);
-                                }, [=](const zero::async::promise::Reason &reason) {
-                                    P_BREAK_E(loop, reason);
                                 });
                             }),
-                            zero::async::promise::loop<void>([=](const auto &loop) {
-                                remote->readFrom(10240)->then(
+                            zero::async::promise::doWhile([=]() {
+                                return remote->readFrom(10240)->then(
                                         [=](nonstd::span<const std::byte> data, const aio::net::Address &from) {
+                                            LOG_INFO(
+                                                    "UDP packet[%llu]: %s <== %s",
+                                                    data.size(),
+                                                    stringify(*clientAddress).c_str(),
+                                                    stringify(from).c_str()
+                                            );
+
                                             if (from.index() == 0)
                                                 writeTarget(local, std::get<aio::net::IPv4Address>(from));
                                             else
                                                 writeTarget(local, std::get<aio::net::IPv6Address>(from));
 
-                                            auto length = htonl((uint32_t) payload.size());
+                                            auto length = htonl((uint32_t) data.size());
 
                                             local->submit({(const std::byte *) &length, sizeof(length)});
-                                            local->submit(payload);
+                                            local->submit(data);
 
                                             return local->drain();
                                         }
-                                )->then([=]() {
-                                    P_CONTINUE(loop);
-                                }, [=](const zero::async::promise::Reason &reason) {
-                                    P_BREAK_E(loop, reason);
-                                });
+                                );
                             })
                     );
+                })->finally([=]() {
+                    remote->close();
                 });
             });
         });
+    })->finally([=]() {
+        LOG_INFO("UDP proxy finished: client[%s]", stringify(*clientAddress).c_str());
     });
 }
 
@@ -147,14 +178,31 @@ std::shared_ptr<zero::async::promise::Promise<void>> proxyTCP(
         const std::shared_ptr<aio::Context> &context,
         const zero::ptr::RefPtr<aio::net::stream::IBuffer> &local
 ) {
+    std::optional<aio::net::Address> clientAddress = local->remoteAddress();
+
+    if (!clientAddress)
+        return zero::async::promise::reject<void>(
+                {aio::IO_ERROR, zero::strings::format("failed to get remote address[%s]", aio::lastError().c_str())}
+        );
+
     return readTarget(local)->then([=](const Target &target) {
-        LOG_INFO("TCP proxy: %s", stringify(target).c_str());
+        LOG_INFO(
+                "TCP proxy request: client[%s] target[%s]",
+                stringify(*clientAddress).c_str(),
+                stringify(target).c_str()
+        );
 
         return resolve(context, target)->then([=](nonstd::span<const aio::net::Address> addresses) {
             return aio::net::stream::connect(
                     context,
                     addresses
             )->then([=](const zero::ptr::RefPtr<aio::net::stream::IBuffer> &remote) {
+                LOG_INFO(
+                        "TCP tunnel: client[%s] target[%s]",
+                        stringify(*clientAddress).c_str(),
+                        stringify(target).c_str()
+                );
+
                 auto response = {std::byte{0}};
 
                 return local->write(response)->then([=] {
@@ -166,10 +214,12 @@ std::shared_ptr<zero::async::promise::Promise<void>> proxyTCP(
                 auto response = {std::byte{1}};
 
                 return local->write(response)->then([=]() {
-                    return zero::async::promise::reject<void>(reason);
+                    return nonstd::make_unexpected(reason);
                 });
             });
         });
+    })->finally([=]() {
+        LOG_INFO("TCP proxy finished: client[%s]", stringify(*clientAddress).c_str());
     });
 }
 
@@ -186,6 +236,19 @@ int main(int argc, char **argv) {
     cmdline.add<std::filesystem::path>("key", "private key path");
 
     cmdline.parse(argc, argv);
+
+#ifdef _WIN32
+    WSADATA wsaData;
+
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        LOG_ERROR("WSAStartup failed");
+        return -1;
+    }
+#endif
+
+#ifdef __unix__
+    signal(SIGPIPE, SIG_IGN);
+#endif
 
     auto ip = cmdline.get<std::string>("ip");
     auto port = cmdline.get<unsigned short>("port");
@@ -217,8 +280,8 @@ int main(int argc, char **argv) {
     if (!listener)
         return -1;
 
-    zero::async::promise::loop<void>([=](const auto &loop) {
-        listener->accept()->then([=](const zero::ptr::RefPtr<aio::net::stream::IBuffer> &buffer) {
+    zero::async::promise::doWhile([=]() {
+        return listener->accept()->then([=](const zero::ptr::RefPtr<aio::net::stream::IBuffer> &buffer) {
             buffer->readExactly(1)->then([=](nonstd::span<const std::byte> data) {
                 auto type = std::to_integer<int>(data[0]);
 
@@ -227,22 +290,32 @@ int main(int argc, char **argv) {
 
                 return proxyUDP(context, buffer);
             })->fail([](const zero::async::promise::Reason &reason) {
-                LOG_INFO("%s", reason.message.c_str());
+                std::vector<std::string> messages = {
+                        zero::strings::format("code[%d] msg[%s]", reason.code, reason.message.c_str())
+                };
+
+                for (auto p = reason.previous; p; p = p->previous)
+                    messages.push_back(zero::strings::format("code[%d] msg[%s]", p->code, p->message.c_str()));
+
+                LOG_ERROR(
+                        "%s",
+                        zero::strings::join(messages, " << ").c_str()
+                );
             })->finally([=]() {
                 buffer->close();
             });
-        })->then([=]() {
-            P_CONTINUE(loop);
-        }, [=](const zero::async::promise::Reason &reason) {
-            P_BREAK_E(loop, reason);
         });
     })->fail([](const zero::async::promise::Reason &reason) {
-        LOG_ERROR("%s", reason.message.c_str());
+        LOG_ERROR("code[%d] msg[%s]", reason.code, reason.message.c_str());
     })->finally([=]() {
         context->loopBreak();
     });
 
     context->dispatch();
+
+#ifdef _WIN32
+    WSACleanup();
+#endif
 
     return 0;
 }

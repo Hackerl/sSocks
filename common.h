@@ -3,6 +3,20 @@
 
 #include <aio/net/stream.h>
 
+enum Error {
+    INVALID_VERSION = -2000,
+    INVALID_ADDRESS,
+    INVALID_REQUEST,
+    INVALID_USER,
+    INVALID_PACKET,
+    UNSUPPORTED_METHOD,
+    UNSUPPORTED_AUTH_METHOD,
+    HANDSHAKE_FAILED,
+    ADDRESS_RESOLVE_ERROR,
+    AUTH_FAILED,
+    PROXY_FAILED
+};
+
 struct HostAddress {
     unsigned short port;
     std::string hostname;

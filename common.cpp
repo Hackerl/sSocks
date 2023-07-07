@@ -111,14 +111,12 @@ std::string stringify(const Target &target) {
         }
 
         case 1: {
-            auto address = std::get<aio::net::IPv4Address>(target);
-            result = zero::os::net::stringify(address.ip) + ":" + std::to_string(address.port);
+            result = aio::net::stringify(std::get<aio::net::IPv4Address>(target));
             break;
         }
 
         case 2: {
-            auto address = std::get<aio::net::IPv6Address>(target);
-            result = zero::os::net::stringify(address.ip) + ":" + std::to_string(address.port);
+            result = aio::net::stringify(std::get<aio::net::IPv6Address>(target));
             break;
         }
     }
