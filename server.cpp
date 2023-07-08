@@ -82,6 +82,8 @@ std::shared_ptr<zero::async::promise::Promise<void>> proxyUDP(
                 {aio::IO_ERROR, zero::strings::format("failed to get remote address[%s]", aio::lastError().c_str())}
         );
 
+    LOG_INFO("UDP proxy: client[%s]", stringify(*clientAddress).c_str());
+
     return readTarget(local)->then([=](const Target &target) {
         return local->readExactly(4)->then([=](nonstd::span<const std::byte> data) {
             return local->readExactly(ntohl(*(uint32_t *) data.data()));
@@ -106,7 +108,7 @@ std::shared_ptr<zero::async::promise::Promise<void>> proxyUDP(
                             }
                     );
 
-                LOG_INFO(
+                LOG_DEBUG(
                         "UDP packet[%llu]: %s ==> %s",
                         payload.size(),
                         stringify(*clientAddress).c_str(),
@@ -127,7 +129,7 @@ std::shared_ptr<zero::async::promise::Promise<void>> proxyUDP(
                                                         =,
                                                         payload = std::vector<std::byte>{data.begin(), data.end()}
                                                 ](nonstd::span<const aio::net::Address> addresses) {
-                                            LOG_INFO(
+                                            LOG_DEBUG(
                                                     "UDP packet[%llu]: %s ==> %s",
                                                     payload.size(),
                                                     stringify(*clientAddress).c_str(),
@@ -142,7 +144,7 @@ std::shared_ptr<zero::async::promise::Promise<void>> proxyUDP(
                             zero::async::promise::doWhile([=]() {
                                 return remote->readFrom(10240)->then(
                                         [=](nonstd::span<const std::byte> data, const aio::net::Address &from) {
-                                            LOG_INFO(
+                                            LOG_DEBUG(
                                                     "UDP packet[%llu]: %s <== %s",
                                                     data.size(),
                                                     stringify(*clientAddress).c_str(),
@@ -184,6 +186,8 @@ std::shared_ptr<zero::async::promise::Promise<void>> proxyTCP(
         return zero::async::promise::reject<void>(
                 {aio::IO_ERROR, zero::strings::format("failed to get remote address[%s]", aio::lastError().c_str())}
         );
+
+    LOG_INFO("TCP proxy: client[%s]", stringify(*clientAddress).c_str());
 
     return readTarget(local)->then([=](const Target &target) {
         LOG_INFO(

@@ -373,7 +373,7 @@ std::shared_ptr<zero::async::promise::Promise<void>> proxyUDP(
 
                                 const auto &[target, payload] = *packet;
 
-                                LOG_INFO(
+                                LOG_DEBUG(
                                         "UDP packet[%llu]: %s ==> %s",
                                         payload.size(),
                                         stringify(from).c_str(),
@@ -396,7 +396,7 @@ std::shared_ptr<zero::async::promise::Promise<void>> proxyUDP(
                         return remote->readExactly(4)->then([=](nonstd::span<const std::byte> data) {
                             return remote->readExactly(ntohl(*(uint32_t *) data.data()));
                         })->then([=](nonstd::span<const std::byte> data) {
-                            LOG_INFO(
+                            LOG_DEBUG(
                                     "UDP packet[%llu]: %s <== %s",
                                     data.size(),
                                     stringify(**client).c_str(),
@@ -484,7 +484,8 @@ std::shared_ptr<zero::async::promise::Promise<void>> proxyTCP(
     auto type = {std::byte{0}};
 
     return remote->write(type)->then([=]() {
-        return writeTarget(remote, target);
+        writeTarget(remote, target);
+        return remote->drain();
     })->then([=]() {
         return remote->readExactly(1);
     })->then([=](nonstd::span<const std::byte> data) {
@@ -546,7 +547,7 @@ int main(int argc, char *argv[]) {
     cmdline.addOptional<std::string>("bind-ip", '\0', "socks5 server ip", "127.0.0.1");
     cmdline.addOptional<unsigned short>("bind-port", '\0', "socks5 server port", 1080);
     cmdline.addOptional<User>("user", 'u', "socks5 server auth(username:password)]");
-    cmdline.addOptional("strict", 's', "restrict UDP source addresses");
+    cmdline.addOptional("strict", '\0', "restrict UDP source addresses");
 
     cmdline.parse(argc, argv);
 
@@ -568,7 +569,7 @@ int main(int argc, char *argv[]) {
     auto bindIP = cmdline.getOptional<std::string>("bind-ip");
     auto bindPort = cmdline.getOptional<unsigned short>("bind-port");
     auto user = cmdline.getOptional<User>("user");
-    auto strict = cmdline.getOptional<bool>("strict");
+    auto strict = cmdline.exist("strict");
 
     std::shared_ptr<aio::Context> context = aio::newContext();
 
@@ -666,7 +667,7 @@ int main(int argc, char *argv[]) {
 
                 LOG_ERROR(
                         "%s",
-                        zero::strings::join(messages, " < ").c_str()
+                        zero::strings::join(messages, " << ").c_str()
                 );
             })->finally([=]() {
                 buffer->close();
