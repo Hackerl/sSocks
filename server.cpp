@@ -218,7 +218,7 @@ std::shared_ptr<zero::async::promise::Promise<void>> proxyTCP(
                 auto response = {std::byte{1}};
 
                 return local->write(response)->then([=]() {
-                    return nonstd::make_unexpected(reason);
+                    return reason;
                 });
             });
         });

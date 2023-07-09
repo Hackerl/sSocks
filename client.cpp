@@ -142,12 +142,9 @@ readUser(const zero::ptr::RefPtr<aio::net::stream::IBuffer> &buffer) {
 
         if (version != 1) {
             auto response = {std::byte{1}, std::byte{1}};
-            return buffer->write(response)->then([=]() -> nonstd::expected<User, zero::async::promise::Reason> {
-                return nonstd::make_unexpected(
-                        zero::async::promise::Reason{
-                                INVALID_VERSION,
-                                zero::strings::format("unsupported auth version[%d]", version)
-                        }
+            return buffer->write(response)->then([=]() {
+                return zero::async::promise::reject<User>(
+                        {INVALID_VERSION, zero::strings::format("unsupported auth version[%d]", version)}
                 );
             });
         }
@@ -198,7 +195,7 @@ handshake(const zero::ptr::RefPtr<aio::net::stream::IBuffer> &buffer, std::optio
             if (input.username != user->username || input.password != user->password) {
                 auto response = {std::byte{1}, std::byte{1}};
                 return buffer->write(response)->then([]() {
-                    return nonstd::make_unexpected(zero::async::promise::Reason{AUTH_FAILED, "auth failed"});
+                    return zero::async::promise::Reason{AUTH_FAILED, "auth failed"};
                 });
             }
 
@@ -500,12 +497,10 @@ std::shared_ptr<zero::async::promise::Promise<void>> proxyTCP(
             };
 
             return local->write(response)->then([=]() {
-                return nonstd::make_unexpected(
-                        zero::async::promise::Reason{
-                                PROXY_FAILED,
-                                zero::strings::format("TCP proxy %s failed", stringify(target).c_str())
-                        }
-                );
+                return zero::async::promise::Reason{
+                        PROXY_FAILED,
+                        zero::strings::format("TCP proxy %s failed", stringify(target).c_str())
+                };
             });
         }
 
