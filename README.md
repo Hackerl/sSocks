@@ -132,6 +132,10 @@ Create openssl 509 extended configuration, then generate all keys and certificat
   openssl x509 -req -days 365 -sha256 -extensions v3_req -CA  cacert.pem -CAkey cakey.pem  -CAserial ca.srl -in client.csr -out client-cert.pem
   ```
 
+Export environment variables:
+* VCPKG_INSTALLATION_ROOT
+* ANDROID_NDK_HOME(Android)
+
 ### Build
 
 * Linux
