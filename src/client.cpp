@@ -371,7 +371,7 @@ std::shared_ptr<zero::async::promise::Promise<void>> proxyUDP(
                                 const auto &[target, payload] = *packet;
 
                                 LOG_DEBUG(
-                                        "UDP packet[%llu]: %s ==> %s",
+                                        "UDP packet[%zu]: %s ==> %s",
                                         payload.size(),
                                         stringify(from).c_str(),
                                         stringify(target).c_str()
@@ -394,7 +394,7 @@ std::shared_ptr<zero::async::promise::Promise<void>> proxyUDP(
                             return remote->readExactly(ntohl(*(uint32_t *) data.data()));
                         })->then([=](nonstd::span<const std::byte> data) {
                             LOG_DEBUG(
-                                    "UDP packet[%llu]: %s <== %s",
+                                    "UDP packet[%zu]: %s <== %s",
                                     data.size(),
                                     stringify(**client).c_str(),
                                     stringify(target).c_str()

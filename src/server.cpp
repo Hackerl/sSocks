@@ -109,7 +109,7 @@ std::shared_ptr<zero::async::promise::Promise<void>> proxyUDP(
                     );
 
                 LOG_DEBUG(
-                        "UDP packet[%llu]: %s ==> %s",
+                        "UDP packet[%zu]: %s ==> %s",
                         payload.size(),
                         stringify(*clientAddress).c_str(),
                         stringify(target).c_str()
@@ -130,7 +130,7 @@ std::shared_ptr<zero::async::promise::Promise<void>> proxyUDP(
                                                         payload = std::vector<std::byte>{data.begin(), data.end()}
                                                 ](nonstd::span<const aio::net::Address> addresses) {
                                             LOG_DEBUG(
-                                                    "UDP packet[%llu]: %s ==> %s",
+                                                    "UDP packet[%zu]: %s ==> %s",
                                                     payload.size(),
                                                     stringify(*clientAddress).c_str(),
                                                     stringify(target).c_str()
@@ -145,7 +145,7 @@ std::shared_ptr<zero::async::promise::Promise<void>> proxyUDP(
                                 return remote->readFrom(10240)->then(
                                         [=](nonstd::span<const std::byte> data, const aio::net::Address &from) {
                                             LOG_DEBUG(
-                                                    "UDP packet[%llu]: %s <== %s",
+                                                    "UDP packet[%zu]: %s <== %s",
                                                     data.size(),
                                                     stringify(*clientAddress).c_str(),
                                                     stringify(from).c_str()
