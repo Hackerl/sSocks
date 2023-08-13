@@ -1,12 +1,11 @@
 #include "common.h"
-#include <aio/net/ssl.h>
-#include <aio/net/dgram.h>
+#include <asyncio/net/ssl.h>
+#include <asyncio/net/dgram.h>
+#include <asyncio/ev/signal.h>
+#include <asyncio/event_loop.h>
 #include <zero/log.h>
 #include <zero/cmdline.h>
-
-#ifdef __unix__
 #include <csignal>
-#endif
 
 struct User {
     std::string username;
@@ -23,13 +22,13 @@ std::optional<User> zero::convert<User>(std::string_view str) {
     return User{zero::strings::trim(tokens[0]), zero::strings::trim(tokens[1])};
 }
 
-bool matchSource(const aio::net::Address &source, const aio::net::Address &from) {
+bool matchSource(const asyncio::net::Address &source, const asyncio::net::Address &from) {
     if (source.index() != from.index())
         return false;
 
     if (source.index() == 0) {
-        auto sourceAddress = std::get<aio::net::IPv4Address>(source);
-        auto fromAddress = std::get<aio::net::IPv4Address>(from);
+        auto sourceAddress = std::get<asyncio::net::IPv4Address>(source);
+        auto fromAddress = std::get<asyncio::net::IPv4Address>(from);
 
         if (sourceAddress.port != 0 && sourceAddress.port != fromAddress.port)
             return false;
@@ -46,8 +45,8 @@ bool matchSource(const aio::net::Address &source, const aio::net::Address &from)
         return std::equal(sourceAddress.ip.begin(), sourceAddress.ip.end(), fromAddress.ip.begin());
     }
 
-    auto sourceAddress = std::get<aio::net::IPv6Address>(source);
-    auto fromAddress = std::get<aio::net::IPv6Address>(from);
+    auto sourceAddress = std::get<asyncio::net::IPv6Address>(source);
+    auto fromAddress = std::get<asyncio::net::IPv6Address>(from);
 
     if (sourceAddress.port != 0 && sourceAddress.port != fromAddress.port)
         return false;
@@ -64,159 +63,203 @@ bool matchSource(const aio::net::Address &source, const aio::net::Address &from)
     return std::equal(sourceAddress.ip.begin(), sourceAddress.ip.end(), fromAddress.ip.begin());
 }
 
-std::shared_ptr<zero::async::promise::Promise<std::tuple<int, Target>>>
-readRequest(const zero::ptr::RefPtr<aio::net::stream::IBuffer> &buffer) {
-    return buffer->readExactly(4)->then([=](nonstd::span<const std::byte> data) {
-        int version = std::to_integer<int>(data[0]);
+zero::async::coroutine::Task<std::tuple<int, Target>, std::error_code>
+readRequest(const std::shared_ptr<asyncio::net::stream::IBuffer> &buffer) {
+    std::byte header[4];
+    auto res = co_await buffer->readExactly(header);
 
-        if (version != 5)
-            return zero::async::promise::reject<std::tuple<int, Target>>(
-                    {INVALID_VERSION, zero::strings::format("unsupported socks version[%d]", version)}
-            );
+    if (!res)
+        co_return tl::unexpected(res.error());
 
-        int type = std::to_integer<int>(data[3]);
-        std::shared_ptr<zero::async::promise::Promise<Target>> promise;
+    if (std::to_integer<int>(header[0]) != 5)
+        co_return tl::unexpected(Error::UNSUPPORTED_VERSION);
 
-        switch (type) {
-            case 1:
-                promise = buffer->readExactly(4)->then([=](const std::vector<std::byte> &data) {
-                    return buffer->readExactly(2)->then([ip = data](nonstd::span<const std::byte> data) -> Target {
-                        aio::net::IPv4Address address = {};
+    tl::expected<std::tuple<int, Target>, std::error_code> result;
 
-                        address.port = ntohs(*(uint16_t *) data.data());
-                        memcpy(address.ip.data(), ip.data(), 4);
+    int command = std::to_integer<int>(header[1]);
+    int type = std::to_integer<int>(header[3]);
 
-                        return address;
-                    });
-                });
+    switch (type) {
+        case 1: {
+            std::array<std::byte, 4> ip = {};
+            res = co_await buffer->readExactly(ip);
 
+            if (!res) {
+                result = tl::unexpected(res.error());
                 break;
-
-            case 3:
-                promise = buffer->readExactly(1)->then([=](nonstd::span<const std::byte> data) {
-                    return buffer->readExactly(std::to_integer<size_t>(data[0]));
-                })->then([=](nonstd::span<const std::byte> data) {
-                    std::string host = std::string{(const char *) data.data(), data.size()};
-                    return buffer->readExactly(2)->then(
-                            [host = std::move(host)](nonstd::span<const std::byte> data) -> Target {
-                                return HostAddress{ntohs(*(uint16_t *) data.data()), host};
-                            }
-                    );
-                });
-
-                break;
-
-            case 4:
-                promise = buffer->readExactly(16)->then([=](const std::vector<std::byte> &data) {
-                    return buffer->readExactly(2)->then([ip = data](nonstd::span<const std::byte> data) -> Target {
-                        aio::net::IPv6Address address = {};
-
-                        address.port = ntohs(*(uint16_t *) data.data());
-                        memcpy(address.ip.data(), ip.data(), 16);
-
-                        return address;
-                    });
-                });
-
-                break;
-
-            default:
-                break;
-        }
-
-        if (!promise)
-            return zero::async::promise::reject<std::tuple<int, Target>>(
-                    {INVALID_ADDRESS, zero::strings::format("unsupported address type[%d]", type)}
-            );
-
-        return promise->then([=](const Target &address) {
-            return std::tuple<int, Target>{std::to_integer<int>(data[1]), address};
-        });
-    })->fail(PF_RETHROW(INVALID_REQUEST, "read proxy request failed"));
-}
-
-std::shared_ptr<zero::async::promise::Promise<User>>
-readUser(const zero::ptr::RefPtr<aio::net::stream::IBuffer> &buffer) {
-    return buffer->readExactly(1)->then([=](nonstd::span<const std::byte> data) {
-        int version = std::to_integer<int>(data[0]);
-
-        if (version != 1) {
-            auto response = {std::byte{1}, std::byte{1}};
-            return buffer->write(response)->then([=]() {
-                return zero::async::promise::reject<User>(
-                        {INVALID_VERSION, zero::strings::format("unsupported auth version[%d]", version)}
-                );
-            });
-        }
-
-        return buffer->readExactly(1)->then([=](nonstd::span<const std::byte> data) {
-            return buffer->readExactly(std::to_integer<size_t>(data[0]));
-        })->then([=](nonstd::span<const std::byte> data) {
-            std::string username = {(const char *) data.data(), data.size()};
-
-            return buffer->readExactly(1)->then([=](nonstd::span<const std::byte> data) {
-                return buffer->readExactly(std::to_integer<size_t>(data[0]));
-            })->then([=, username = std::move(username)](nonstd::span<const std::byte> data) {
-                return User{username, {(const char *) data.data(), data.size()}};
-            });
-        });
-    })->fail(PF_RETHROW(INVALID_USER, "read user failed"));
-}
-
-std::shared_ptr<zero::async::promise::Promise<void>>
-handshake(const zero::ptr::RefPtr<aio::net::stream::IBuffer> &buffer, std::optional<User> user) {
-    return buffer->readExactly(2)->then([=](nonstd::span<const std::byte> data) {
-        int version = std::to_integer<int>(data[0]);
-
-        if (version != 5)
-            return zero::async::promise::reject<std::vector<std::byte>>(
-                    {INVALID_VERSION, zero::strings::format("unsupported socks version[%d]", version)}
-            );
-
-        return buffer->readExactly(std::to_integer<size_t>(data[1]));
-    })->then([=](nonstd::span<const std::byte> data) {
-        if (!user) {
-            auto response = {std::byte{5}, std::byte{0}};
-            return buffer->write(response);
-        }
-
-        if (std::find(data.begin(), data.end(), std::byte{2}) == data.end()) {
-            auto response = {std::byte{5}, std::byte{0xff}};
-            return buffer->write(response)->then([]() {
-                return zero::async::promise::reject<void>({UNSUPPORTED_AUTH_METHOD, "unsupported auth method"});
-            });
-        }
-
-        auto response = {std::byte{5}, std::byte{2}};
-
-        return buffer->write(response)->then([=]() {
-            return readUser(buffer);
-        })->then([=](const User &input) {
-            if (input.username != user->username || input.password != user->password) {
-                auto response = {std::byte{1}, std::byte{1}};
-                return buffer->write(response)->then([]() {
-                    return zero::async::promise::Reason{AUTH_FAILED, "auth failed"};
-                });
             }
 
-            auto response = {std::byte{1}, std::byte{0}};
-            return buffer->write(response);
-        });
-    })->fail(PF_RETHROW(HANDSHAKE_FAILED, "handshake failed"));
+            std::byte port[2];
+            res = co_await buffer->readExactly(port);
+
+            if (!res) {
+                result = tl::unexpected(res.error());
+                break;
+            }
+
+            result = {command, asyncio::net::IPv4Address{ntohs(*(uint16_t *) port), ip}};
+            break;
+        }
+
+        case 3: {
+            std::byte length[1];
+            res = co_await buffer->readExactly(length);
+
+            if (!res) {
+                result = tl::unexpected(res.error());
+                break;
+            }
+
+            std::vector<std::byte> host(std::to_integer<size_t>(length[0]));
+            res = co_await buffer->readExactly(host);
+
+            if (!res) {
+                result = tl::unexpected(res.error());
+                break;
+            }
+
+            std::byte port[2];
+            res = co_await buffer->readExactly(port);
+
+            if (!res) {
+                result = tl::unexpected(res.error());
+                break;
+            }
+
+            result = {command, HostAddress{ntohs(*(uint16_t *) port), {(const char *) host.data(), host.size()}}};
+            break;
+        }
+
+        case 4: {
+            std::array<std::byte, 16> ip = {};
+            res = co_await buffer->readExactly(ip);
+
+            if (!res) {
+                result = tl::unexpected(res.error());
+                break;
+            }
+
+            std::byte port[2];
+            res = co_await buffer->readExactly(port);
+
+            if (!res) {
+                result = tl::unexpected(res.error());
+                break;
+            }
+
+            result = {command, asyncio::net::IPv6Address{ntohs(*(uint16_t *) port), ip}};
+            break;
+        }
+
+        default:
+            result = tl::unexpected<std::error_code>(Error::UNSUPPORTED_ADDRESS_TYPE);
+            break;
+    }
+
+    co_return result;
 }
 
-std::optional<std::tuple<Target, nonstd::span<const std::byte>>>
-unpack(nonstd::span<const std::byte> data) {
+zero::async::coroutine::Task<User, std::error_code>
+readUser(const std::shared_ptr<asyncio::net::stream::IBuffer> &buffer) {
+    std::byte version[1];
+    auto result = co_await buffer->readExactly(version);
+
+    if (!result)
+        co_return tl::unexpected(result.error());
+
+    if (std::to_integer<int>(version[0]) != 1)
+        co_return tl::unexpected(Error::UNSUPPORTED_AUTH_VERSION);
+
+    std::byte length[1];
+    result = co_await buffer->readExactly(length);
+
+    if (!result)
+        co_return tl::unexpected(result.error());
+
+    std::vector<std::byte> username(std::to_integer<size_t>(length[0]));
+    result = co_await buffer->readExactly(username);
+
+    if (!result)
+        co_return tl::unexpected(result.error());
+
+    result = co_await buffer->readExactly(length);
+
+    if (!result)
+        co_return tl::unexpected(result.error());
+
+    std::vector<std::byte> password(std::to_integer<size_t>(length[0]));
+    result = co_await buffer->readExactly(password);
+
+    if (!result)
+        co_return tl::unexpected(result.error());
+
+    co_return User{
+            {(const char *) username.data(), username.size()},
+            {(const char *) password.data(), password.size()}
+    };
+}
+
+zero::async::coroutine::Task<void, std::error_code>
+handshake(const std::shared_ptr<asyncio::net::stream::IBuffer> &buffer, std::optional<User> account) {
+    std::byte header[2];
+    auto result = co_await buffer->readExactly(header);
+
+    if (!result)
+        co_return tl::unexpected(result.error());
+
+    std::vector<std::byte> methods(std::to_integer<size_t>(header[1]));
+
+    result = co_await buffer->readExactly(methods);
+
+    if (!result)
+        co_return tl::unexpected(result.error());
+
+    if (!account) {
+        auto response = {std::byte{5}, std::byte{0}};
+        co_return co_await buffer->write(response);
+    }
+
+    if (std::find(methods.begin(), methods.end(), std::byte{2}) == methods.end()) {
+        auto response = {std::byte{5}, std::byte{0xff}};
+        co_await buffer->write(response);
+        co_return tl::unexpected(Error::UNSUPPORTED_AUTH_METHOD);
+    }
+
+    std::array<std::byte, 2> response = {std::byte{5}, std::byte{2}};
+    result = co_await buffer->write(response);
+
+    if (!result)
+        co_return tl::unexpected(result.error());
+
+    auto user = co_await readUser(buffer);
+
+    if (!user) {
+        response = {std::byte{1}, std::byte{1}};
+        co_await buffer->write(response);
+        co_return tl::unexpected(user.error());
+    }
+
+    if (user->username != account->username || user->password != account->password) {
+        response = {std::byte{1}, std::byte{1}};
+        co_await buffer->write(response);
+        co_return tl::unexpected(AUTH_FAILED);
+    }
+
+    response = {std::byte{1}, std::byte{0}};
+    co_return co_await buffer->write(response);
+}
+
+std::optional<std::tuple<Target, std::span<const std::byte>>> unpack(std::span<const std::byte> data) {
     if (data[2] != std::byte{0}) {
         LOG_ERROR("fragmentation is not supported");
         return std::nullopt;
     }
 
-    std::optional<std::tuple<Target, nonstd::span<const std::byte>>> packet;
+    std::optional<std::tuple<Target, std::span<const std::byte>>> packet;
 
     switch (std::to_integer<int>(data[3])) {
         case 1: {
-            aio::net::IPv4Address address = {};
+            asyncio::net::IPv4Address address = {};
 
             address.port = ntohs(*(uint16_t *) (data.data() + 8));
             memcpy(address.ip.data(), data.subspan<4, 4>().data(), 4);
@@ -241,7 +284,7 @@ unpack(nonstd::span<const std::byte> data) {
         }
 
         case 4: {
-            aio::net::IPv6Address address = {};
+            asyncio::net::IPv6Address address = {};
 
             address.port = ntohs(*(uint16_t *) (data.data() + 20));
             memcpy(address.ip.data(), data.subspan<4, 16>().data(), 16);
@@ -258,60 +301,46 @@ unpack(nonstd::span<const std::byte> data) {
     return packet;
 }
 
-std::shared_ptr<zero::async::promise::Promise<void>> proxyUDP(
-        const std::shared_ptr<aio::Context> &context,
-        const zero::ptr::RefPtr<aio::net::stream::IBuffer> &buffer,
-        const zero::ptr::RefPtr<aio::net::stream::IBuffer> &remote,
-        const std::optional<aio::net::Address> &source
+zero::async::coroutine::Task<void> proxyUDP(
+        const std::shared_ptr<asyncio::net::stream::IBuffer> &buffer,
+        const std::shared_ptr<asyncio::net::stream::IBuffer> &remote,
+        const std::optional<asyncio::net::Address> &source
 ) {
-    std::optional<aio::net::Address> localAddress = buffer->localAddress();
+    auto localAddress = buffer->localAddress();
 
-    if (!localAddress)
-        return zero::async::promise::reject<void>(
-                {aio::IO_ERROR, zero::strings::format("failed to get local address[%s]", aio::lastError().c_str())}
-        );
+    if (!localAddress) {
+        LOG_ERROR("get local address failed[%s]", localAddress.error().message().c_str());
+        co_return;
+    }
 
     bool isIPv4 = localAddress->index() == 0;
-    zero::ptr::RefPtr<aio::net::dgram::Socket> local;
+    std::optional<asyncio::net::Address> bindAddress;
 
     if (isIPv4)
-        local = aio::net::dgram::bind(
-                context,
-                aio::net::IPv4Address{
-                        0,
-                        std::get<aio::net::IPv4Address>(*localAddress).ip
-                }
-        );
+        bindAddress = asyncio::net::IPv4Address{0, std::get<asyncio::net::IPv4Address>(*localAddress).ip};
     else
-        local = aio::net::dgram::bind(
-                context,
-                aio::net::IPv6Address{
-                        0,
-                        std::get<aio::net::IPv6Address>(*localAddress).ip
-                }
-        );
+        bindAddress = asyncio::net::IPv6Address{0, std::get<asyncio::net::IPv6Address>(*localAddress).ip};
 
-    if (!local)
-        return zero::async::promise::reject<void>(
-                {
-                        aio::IO_ERROR,
-                        zero::strings::format("bind datagram socket failed[%s]", aio::lastError().c_str())
-                }
-        );
+    auto local = asyncio::net::dgram::bind(*bindAddress);
 
-    std::optional<aio::net::Address> bindAddress = local->localAddress();
+    if (!local) {
+        LOG_ERROR("dgram socket bind failed[%s]", local.error().message().c_str());
+        co_return;
+    }
 
-    if (!bindAddress)
-        return zero::async::promise::reject<void>(
-                {aio::IO_ERROR, zero::strings::format("failed to get local address[%s]", aio::lastError().c_str())}
-        );
+    auto address = local->localAddress();
+
+    if (!address) {
+        LOG_ERROR("get local address failed[%s]", localAddress.error().message().c_str());
+        co_return;
+    }
 
     std::vector<std::byte> response = {std::byte{5}, std::byte{0}, std::byte{0}};
 
     if (isIPv4) {
         response.push_back(std::byte{1});
 
-        auto ipv4Address = std::get<aio::net::IPv4Address>(*bindAddress);
+        auto ipv4Address = std::get<asyncio::net::IPv4Address>(*address);
         unsigned short bindPort = htons(ipv4Address.port);
 
         response.insert(response.end(), ipv4Address.ip.begin(), ipv4Address.ip.end());
@@ -323,7 +352,7 @@ std::shared_ptr<zero::async::promise::Promise<void>> proxyUDP(
     } else {
         response.push_back(std::byte{4});
 
-        auto ipv6Address = std::get<aio::net::IPv6Address>(*bindAddress);
+        auto ipv6Address = std::get<asyncio::net::IPv6Address>(*address);
         unsigned short bindPort = htons(ipv6Address.port);
 
         response.insert(response.end(), ipv6Address.ip.begin(), ipv6Address.ip.end());
@@ -334,197 +363,271 @@ std::shared_ptr<zero::async::promise::Promise<void>> proxyUDP(
         );
     }
 
-    return buffer->write(response)->then([=]() {
-        auto type = {std::byte{1}};
-        return remote->write(type);
-    })->then([=]() {
-        std::shared_ptr<std::optional<aio::net::Address>> client = std::make_shared<std::optional<aio::net::Address>>();
+    auto result = co_await buffer->write(response);
 
-        return zero::async::promise::race(
-                buffer->waitClosed(),
-                zero::async::promise::doWhile([=]() {
-                    return local->readFrom(10240)->then(
-                            [=](nonstd::span<const std::byte> data, const aio::net::Address &from) {
-                                if (source && !matchSource(*source, from)) {
-                                    LOG_WARNING(
-                                            "forbidden address: %s does not match %s",
-                                            stringify(from).c_str(),
-                                            stringify(*source).c_str()
-                                    );
+    if (!result) {
+        LOG_ERROR("write response failed[%s]", result.error().message().c_str());
+        co_return;
+    }
 
-                                    return zero::async::promise::resolve<void>();
-                                }
+    auto type = {std::byte{1}};
+    result = co_await remote->write(type);
 
-                                if (!*client) {
-                                    LOG_INFO("UDP client: %s", stringify(from).c_str());
-                                    *client = from;
-                                } else if (from != **client) {
-                                    LOG_WARNING("ignore UDP packet from %s", stringify(from).c_str());
-                                    return zero::async::promise::resolve<void>();
-                                }
+    if (!result) {
+        LOG_ERROR("write address type failed[%s]", result.error().message().c_str());
+        co_return;
+    }
 
-                                auto packet = unpack(data);
+    std::optional<asyncio::net::Address> client;
 
-                                if (!packet)
-                                    return zero::async::promise::reject<void>({INVALID_PACKET, "invalid UDP packet"});
+    co_await zero::async::coroutine::race(
+            [&]() -> zero::async::coroutine::Task<void> {
+                co_await buffer->waitClosed();
+            }(),
+            [&]() -> zero::async::coroutine::Task<void> {
+                while (true) {
+                    std::byte data[10240];
+                    auto result = co_await local->readFrom(data);
 
-                                const auto &[target, payload] = *packet;
+                    if (!result) {
+                        LOG_ERROR("read packet failed[%s]", result.error().message().c_str());
+                        break;
+                    }
 
-                                LOG_DEBUG(
-                                        "UDP packet[%zu]: %s ==> %s",
-                                        payload.size(),
-                                        stringify(from).c_str(),
-                                        stringify(target).c_str()
-                                );
+                    auto &[n, from] = *result;
 
-                                writeTarget(remote, target);
+                    if (source && !matchSource(*source, from)) {
+                        LOG_WARNING(
+                                "forbidden address[%s does not match %s]",
+                                stringify(from).c_str(),
+                                stringify(*source).c_str()
+                        );
+                        break;
+                    }
 
-                                auto length = htonl((uint32_t) payload.size());
+                    if (!client) {
+                        LOG_INFO("UDP client[%s]", stringify(from).c_str());
+                        client = from;
+                    } else if (from != *client) {
+                        LOG_WARNING("ignore UDP packet[%s]", stringify(from).c_str());
+                        break;
+                    }
 
-                                remote->submit({(const std::byte *) &length, sizeof(length)});
-                                remote->submit(payload);
+                    auto packet = unpack({data, n});
 
-                                return remote->drain();
-                            }
+                    if (!packet) {
+                        LOG_ERROR("invalid UDP packet");
+                        break;
+                    }
+
+                    const auto &[target, payload] = *packet;
+
+                    LOG_DEBUG(
+                            "UDP packet[%s = %zu => %s]",
+                            stringify(from).c_str(),
+                            payload.size(),
+                            stringify(target).c_str()
                     );
-                }),
-                zero::async::promise::doWhile([=]() {
-                    return readTarget(remote)->then([=](const Target &target) {
-                        return remote->readExactly(4)->then([=](nonstd::span<const std::byte> data) {
-                            return remote->readExactly(ntohl(*(uint32_t *) data.data()));
-                        })->then([=](nonstd::span<const std::byte> data) {
-                            LOG_DEBUG(
-                                    "UDP packet[%zu]: %s <== %s",
-                                    data.size(),
-                                    stringify(**client).c_str(),
-                                    stringify(target).c_str()
-                            );
 
-                            std::vector<std::byte> response = {
-                                    std::byte{0}, std::byte{0},
-                                    std::byte{0}
-                            };
+                    auto res = co_await writeTarget(remote, target);
 
-                            if (target.index() == 1) {
-                                response.push_back(std::byte{1});
+                    if (!res) {
+                        LOG_ERROR("write target failed[%s]", res.error().message().c_str());
+                        break;
+                    }
 
-                                auto ipv4Address = std::get<aio::net::IPv4Address>(target);
-                                unsigned short port = htons(ipv4Address.port);
+                    auto length = htonl((uint32_t) payload.size());
 
-                                response.insert(
-                                        response.end(),
-                                        ipv4Address.ip.begin(),
-                                        ipv4Address.ip.end()
-                                );
+                    remote->submit({(const std::byte *) &length, sizeof(length)});
+                    remote->submit(payload);
 
-                                response.insert(
-                                        response.end(),
-                                        (const std::byte *) &port,
-                                        (const std::byte *) &port + sizeof(unsigned short)
-                                );
+                    res = co_await remote->drain();
 
-                                response.insert(response.end(), data.begin(), data.end());
+                    if (!res) {
+                        LOG_ERROR("write to remote failed[%s]", res.error().message().c_str());
+                        break;
+                    }
+                }
+            }(),
+            [&]() -> zero::async::coroutine::Task<void> {
+                while (true) {
+                    auto target = co_await readTarget(remote);
 
-                                return local->writeTo(response, **client);
-                            }
+                    if (!target) {
+                        LOG_ERROR("read target failed[%s]", target.error().message().c_str());
+                        break;
+                    }
 
-                            response.push_back(std::byte{4});
+                    std::byte length[4];
+                    auto result = co_await remote->readExactly(length);
 
-                            auto ipv6Address = std::get<aio::net::IPv6Address>(target);
-                            unsigned short port = htons(ipv6Address.port);
+                    if (!result) {
+                        LOG_ERROR("read packet length failed[%s]", result.error().message().c_str());
+                        break;
+                    }
 
-                            response.insert(
-                                    response.end(),
-                                    ipv6Address.ip.begin(),
-                                    ipv6Address.ip.end()
-                            );
+                    std::vector<std::byte> payload(ntohl(*(uint32_t *) length));
+                    result = co_await remote->readExactly(payload);
 
-                            response.insert(
-                                    response.end(),
-                                    (const std::byte *) &port,
-                                    (const std::byte *) &port + sizeof(unsigned short)
-                            );
+                    if (!result) {
+                        LOG_ERROR("read packet failed[%s]", result.error().message().c_str());
+                        break;
+                    }
 
-                            response.insert(response.end(), data.begin(), data.end());
+                    LOG_DEBUG(
+                            "UDP packet[%s <= %zu = %s]",
+                            stringify(*client).c_str(),
+                            payload.size(),
+                            stringify(*target).c_str()
+                    );
 
-                            return local->writeTo(response, **client);
-                        });
-                    });
-                })
-        )->finally([=]() {
-            LOG_INFO("UDP proxy finished: client[%s]", *client ? stringify(**client).c_str() : "none");
-        });
-    })->finally([=]() {
-        local->close();
-    });
+                    std::vector<std::byte> response = {
+                            std::byte{0}, std::byte{0},
+                            std::byte{0}
+                    };
+
+                    if (target->index() == 1) {
+                        response.push_back(std::byte{1});
+
+                        auto ipv4Address = std::get<asyncio::net::IPv4Address>(*target);
+                        unsigned short port = htons(ipv4Address.port);
+
+                        response.insert(
+                                response.end(),
+                                ipv4Address.ip.begin(),
+                                ipv4Address.ip.end()
+                        );
+
+                        response.insert(
+                                response.end(),
+                                (const std::byte *) &port,
+                                (const std::byte *) &port + sizeof(unsigned short)
+                        );
+
+                        response.insert(response.end(), payload.begin(), payload.end());
+                        auto res = co_await local->writeTo(response, *client);
+
+                        if (!res) {
+                            LOG_ERROR("write packet to client failed[%s]", res.error().message().c_str());
+                            break;
+                        }
+
+                        continue;
+                    }
+
+                    response.push_back(std::byte{4});
+
+                    auto ipv6Address = std::get<asyncio::net::IPv6Address>(*target);
+                    unsigned short port = htons(ipv6Address.port);
+
+                    response.insert(
+                            response.end(),
+                            ipv6Address.ip.begin(),
+                            ipv6Address.ip.end()
+                    );
+
+                    response.insert(
+                            response.end(),
+                            (const std::byte *) &port,
+                            (const std::byte *) &port + sizeof(unsigned short)
+                    );
+
+                    response.insert(response.end(), payload.begin(), payload.end());
+                    auto res = co_await local->writeTo(response, *client);
+
+                    if (!res) {
+                        LOG_ERROR("write packet to client failed[%s]", res.error().message().c_str());
+                        break;
+                    }
+                }
+            }()
+    );
 }
 
-std::shared_ptr<zero::async::promise::Promise<void>> proxyTCP(
-        const std::shared_ptr<aio::Context> &context,
-        const zero::ptr::RefPtr<aio::net::stream::IBuffer> &local,
-        const zero::ptr::RefPtr<aio::net::stream::IBuffer> &remote,
+zero::async::coroutine::Task<void> proxyTCP(
+        const std::shared_ptr<asyncio::net::stream::IBuffer> &local,
+        const std::shared_ptr<asyncio::net::stream::IBuffer> &remote,
         const Target &target
 ) {
-    std::optional<aio::net::Address> clientAddress = local->remoteAddress();
+    auto clientAddress = local->remoteAddress();
 
-    if (!clientAddress)
-        return zero::async::promise::reject<void>(
-                {aio::IO_ERROR, zero::strings::format("failed to get remote address[%s]", aio::lastError().c_str())}
-        );
+    if (!clientAddress) {
+        LOG_ERROR("get remote address failed[%s]", clientAddress.error().message().c_str());
+        co_return;
+    }
 
     LOG_INFO(
-            "TCP proxy request: client[%s] target[%s]",
+            "TCP proxy[%s <==> %s]",
             stringify(*clientAddress).c_str(),
             stringify(target).c_str()
     );
 
     auto type = {std::byte{0}};
+    auto result = co_await remote->write(type);
 
-    return remote->write(type)->then([=]() {
-        writeTarget(remote, target);
-        return remote->drain();
-    })->then([=]() {
-        return remote->readExactly(1);
-    })->then([=](nonstd::span<const std::byte> data) {
-        if (data[0] != std::byte{0}) {
-            auto response = {
-                    std::byte{5},
-                    std::byte{5},
-                    std::byte{0},
-                    std::byte{1},
-                    std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
-                    std::byte{0}, std::byte{0}
-            };
+    if (!result) {
+        LOG_ERROR("write proxy type failed[%s]", result.error().message().c_str());
+        co_return;
+    }
 
-            return local->write(response)->then([=]() {
-                return zero::async::promise::Reason{
-                        PROXY_FAILED,
-                        zero::strings::format("TCP proxy %s failed", stringify(target).c_str())
-                };
-            });
-        }
+    result = co_await writeTarget(remote, target);
 
-        LOG_INFO(
-                "TCP tunnel: client[%s] target[%s]",
-                stringify(*clientAddress).c_str(),
-                stringify(target).c_str()
-        );
+    if (!result) {
+        LOG_ERROR("write target failed[%s]", result.error().message().c_str());
+        co_return;
+    }
 
+    std::byte status[1];
+    result = co_await remote->readExactly(status);
+
+    if (!result) {
+        LOG_ERROR("read status code failed[%s]", result.error().message().c_str());
+        co_return;
+    }
+
+    if (std::to_integer<int>(status[0]) != 0) {
         auto response = {
                 std::byte{5},
-                std::byte{0},
+                std::byte{5},
                 std::byte{0},
                 std::byte{1},
                 std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
                 std::byte{0}, std::byte{0}
         };
 
-        return local->write(response)->then([=] {
-            return aio::tunnel(local, remote);
-        });
-    })->finally([=]() {
-        LOG_INFO("TCP proxy finished: client[%s]", stringify(*clientAddress).c_str());
-    });
+        result = co_await local->write(response);
+
+        if (!result) {
+            LOG_ERROR("write response failed[%s]", result.error().message().c_str());
+            co_return;
+        }
+
+        co_return;
+    }
+
+    LOG_INFO(
+            "TCP tunnel[%s <==> %s]",
+            stringify(*clientAddress).c_str(),
+            stringify(target).c_str()
+    );
+
+    auto response = {
+            std::byte{5},
+            std::byte{0},
+            std::byte{0},
+            std::byte{1},
+            std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
+            std::byte{0}, std::byte{0}
+    };
+
+    result = co_await local->write(response);
+
+    if (!result) {
+        LOG_ERROR("write response failed[%s]", result.error().message().c_str());
+        co_return;
+    }
+
+    co_await zero::async::coroutine::race(asyncio::copy(*local, *remote), asyncio::copy(*remote, *local));
 }
 
 int main(int argc, char *argv[]) {
@@ -541,7 +644,7 @@ int main(int argc, char *argv[]) {
 
     cmdline.addOptional<std::string>("bind-ip", '\0', "socks5 server ip", "127.0.0.1");
     cmdline.addOptional<unsigned short>("bind-port", '\0', "socks5 server port", 1080);
-    cmdline.addOptional<User>("user", 'u', "socks5 server auth(username:password)]");
+    cmdline.addOptional<User>("user", 'u', "socks5 server auth[username:password]");
     cmdline.addOptional("strict", '\0', "restrict UDP source addresses");
 
     cmdline.parse(argc, argv);
@@ -561,120 +664,119 @@ int main(int argc, char *argv[]) {
 
     auto server = cmdline.get<std::string>("server");
     auto port = cmdline.get<unsigned short>("port");
+    auto ca = cmdline.get<std::filesystem::path>("ca");
+    auto cert = cmdline.get<std::filesystem::path>("cert");
+    auto privateKey = cmdline.get<std::filesystem::path>("key");
+
     auto bindIP = cmdline.getOptional<std::string>("bind-ip");
     auto bindPort = cmdline.getOptional<unsigned short>("bind-port");
     auto user = cmdline.getOptional<User>("user");
     auto strict = cmdline.exist("strict");
 
-    std::shared_ptr<aio::Context> context = aio::newContext();
+    asyncio::run([&]() -> zero::async::coroutine::Task<void> {
+        auto context = asyncio::net::ssl::newContext(
+                {
+                        .ca = ca,
+                        .cert = cert,
+                        .privateKey = privateKey,
+                }
+        );
 
-    if (!context)
-        return -1;
+        if (!context) {
+            LOG_ERROR("create ssl context failed[%s]", context.error().message().c_str());
+            co_return;
+        }
 
-    aio::net::ssl::Config config = {};
+        auto listener = asyncio::net::stream::listen(*bindIP, *bindPort);
 
-    config.ca = cmdline.get<std::filesystem::path>("ca");
-    config.cert = cmdline.get<std::filesystem::path>("cert");
-    config.privateKey = cmdline.get<std::filesystem::path>("key");
+        if (!listener) {
+            LOG_ERROR("listen failed[%s]", listener.error().message().c_str());
+            co_return;
+        }
 
-    std::shared_ptr<aio::net::ssl::Context> ctx = aio::net::ssl::newContext(config);
+        auto signal = asyncio::ev::makeSignal(SIGINT);
 
-    if (!ctx)
-        return -1;
+        if (!signal) {
+            LOG_ERROR("make signal failed[%s]", signal.error().message().c_str());
+            co_return;
+        }
 
-    zero::ptr::RefPtr<aio::net::stream::Listener> listener = aio::net::stream::listen(context, *bindIP, *bindPort);
+        auto handle = [&](std::shared_ptr<asyncio::net::stream::IBuffer> buffer) -> zero::async::coroutine::Task<void> {
+            auto result = co_await handshake(buffer, user);
 
-    if (!listener)
-        return -1;
+            if (!result) {
+                LOG_ERROR("handshake failed[%s]", result.error().message().c_str());
+                co_return;
+            }
 
-    zero::async::promise::doWhile([=]() {
-        return listener->accept()->then([=](const zero::ptr::RefPtr<aio::net::stream::IBuffer> &buffer) {
-            handshake(buffer, user)->then([=]() {
-                return readRequest(buffer);
-            })->then([=](int command, const Target &target) {
-                std::shared_ptr<zero::async::promise::Promise<void>> promise;
+            auto request = co_await readRequest(buffer);
 
-                switch (command) {
-                    case 1: {
-                        promise = aio::net::ssl::stream::connect(
-                                context,
-                                server,
-                                port,
-                                ctx
-                        )->then([=](const zero::ptr::RefPtr<aio::net::stream::IBuffer> &remote) {
-                            return proxyTCP(context, buffer, remote, target)->finally([=]() {
-                                remote->close();
-                            });
-                        });
+            if (!request) {
+                LOG_ERROR("read request failed[%s]", request.error().message().c_str());
+                co_return;
+            }
 
-                        break;
-                    }
+            auto remote = co_await asyncio::net::ssl::stream::connect(*context, server, port);
 
-                    case 3: {
-                        std::optional<aio::net::Address> source;
+            if (!remote) {
+                LOG_ERROR("connect to remote failed[%s]", remote.error().message().c_str());
+                co_return;
+            }
 
-                        if (strict) {
-                            switch (target.index()) {
-                                case 1:
-                                    source = std::get<aio::net::IPv4Address>(target);
-                                    break;
+            auto &[command, target] = *request;
 
-                                case 2:
-                                    source = std::get<aio::net::IPv6Address>(target);
-                                    break;
-
-                                default:
-                                    break;
-                            }
-                        }
-
-                        promise = aio::net::ssl::stream::connect(
-                                context,
-                                server,
-                                port,
-                                ctx
-                        )->then([=](const zero::ptr::RefPtr<aio::net::stream::IBuffer> &remote) {
-                            return proxyUDP(context, buffer, remote, source)->finally([=]() {
-                                remote->close();
-                            });
-                        });
-
-                        break;
-                    }
-
-                    default:
-                        break;
+            switch (command) {
+                case 1: {
+                    co_await proxyTCP(buffer, *remote, target);
+                    break;
                 }
 
-                if (!promise)
-                    return zero::async::promise::reject<void>(
-                            {UNSUPPORTED_METHOD, zero::strings::format("unsupported proxy command[%d]", command)}
-                    );
+                case 3: {
+                    std::optional<asyncio::net::Address> source;
 
-                return promise;
-            })->fail([](const zero::async::promise::Reason &reason) {
-                std::vector<std::string> messages = {
-                        zero::strings::format("code[%d] msg[%s]", reason.code, reason.message.c_str())
-                };
+                    if (strict) {
+                        switch (target.index()) {
+                            case 1:
+                                source = std::get<asyncio::net::IPv4Address>(target);
+                                break;
 
-                for (auto p = reason.previous; p; p = p->previous)
-                    messages.push_back(zero::strings::format("code[%d] msg[%s]", p->code, p->message.c_str()));
+                            case 2:
+                                source = std::get<asyncio::net::IPv6Address>(target);
+                                break;
 
-                LOG_ERROR(
-                        "%s",
-                        zero::strings::join(messages, " << ").c_str()
-                );
-            })->finally([=]() {
-                buffer->close();
-            });
-        });
-    })->fail([](const zero::async::promise::Reason &reason) {
-        LOG_ERROR("code[%d] msg[%s]", reason.code, reason.message.c_str());
-    })->finally([=]() {
-        context->loopBreak();
+                            default:
+                                break;
+                        }
+                    }
+
+                    co_await proxyUDP(buffer, *remote, source);
+                    break;
+                }
+
+                default:
+                    break;
+            }
+        };
+
+        co_await zero::async::coroutine::allSettled(
+                [&]() -> zero::async::coroutine::Task<void> {
+                    co_await signal->on();
+                    listener->close();
+                }(),
+                [&]() -> zero::async::coroutine::Task<void> {
+                    while (true) {
+                        auto result = co_await listener->accept();
+
+                        if (!result) {
+                            LOG_ERROR("accept failed[%s]", result.error().message().c_str());
+                            break;
+                        }
+
+                        handle(*result);
+                    }
+                }()
+        );
     });
-
-    context->dispatch();
 
 #ifdef _WIN32
     WSACleanup();

@@ -1,8 +1,53 @@
 #include "common.h"
-#include <cstring>
 #include <zero/os/net.h>
 
-void writeTarget(const zero::ptr::RefPtr<aio::net::stream::IBuffer> &buffer, const Target &target) {
+const char *Category::name() const noexcept {
+    return "sSocks";
+}
+
+std::string Category::message(int value) const {
+    std::string msg;
+
+    switch (value) {
+        case UNSUPPORTED_VERSION:
+            msg = "unsupported version";
+            break;
+
+        case UNSUPPORTED_AUTH_VERSION:
+            msg = "unsupported auth version";
+            break;
+
+        case UNSUPPORTED_AUTH_METHOD:
+            msg = "unsupported auth method";
+            break;
+
+        case UNSUPPORTED_ADDRESS_TYPE:
+            msg = "unsupported address type";
+            break;
+
+        case AUTH_FAILED:
+            msg = "auth failed";
+            break;
+
+        default:
+            msg = "unknown";
+            break;
+    }
+
+    return msg;
+}
+
+const std::error_category &category() {
+    static Category instance;
+    return instance;
+}
+
+std::error_code make_error_code(Error e) {
+    return {static_cast<int>(e), category()};
+}
+
+zero::async::coroutine::Task<void, std::error_code>
+writeTarget(const std::shared_ptr<asyncio::net::stream::IBuffer> &buffer, const Target &target) {
     switch (target.index()) {
         case 0: {
             auto address = std::get<HostAddress>(target);
@@ -17,7 +62,7 @@ void writeTarget(const zero::ptr::RefPtr<aio::net::stream::IBuffer> &buffer, con
         }
 
         case 1: {
-            auto address = std::get<aio::net::IPv4Address>(target);
+            auto address = std::get<asyncio::net::IPv4Address>(target);
             auto port = htons(address.port);
             auto type = {std::byte{1}};
 
@@ -29,7 +74,7 @@ void writeTarget(const zero::ptr::RefPtr<aio::net::stream::IBuffer> &buffer, con
         }
 
         case 2: {
-            auto address = std::get<aio::net::IPv6Address>(target);
+            auto address = std::get<asyncio::net::IPv6Address>(target);
             auto port = htons(address.port);
             auto type = {std::byte{2}};
 
@@ -40,64 +85,69 @@ void writeTarget(const zero::ptr::RefPtr<aio::net::stream::IBuffer> &buffer, con
             break;
         }
     }
+
+    co_return co_await buffer->drain();
 }
 
-std::shared_ptr<zero::async::promise::Promise<Target>>
-readTarget(const zero::ptr::RefPtr<aio::net::stream::IBuffer> &buffer) {
-    return buffer->readExactly(1)->then([=](nonstd::span<const std::byte> data) {
-        std::shared_ptr<zero::async::promise::Promise<Target>> promise;
+zero::async::coroutine::Task<Target, std::error_code>
+readTarget(const std::shared_ptr<asyncio::net::stream::IBuffer> &buffer) {
+    std::byte type[1];
+    auto res = co_await buffer->readExactly(type);
 
-        switch (std::to_integer<size_t>(data[0])) {
-            case 0: {
-                promise = buffer->readExactly(2)->then([=](nonstd::span<const std::byte> data) {
-                    auto port = ntohs(*(uint16_t *) data.data());
-                    return buffer->readLine()->then([=](const std::string &hostname) -> Target {
-                        return HostAddress{port, hostname};
-                    });
-                });
+    if (!res)
+        co_return tl::unexpected(res.error());
 
+    std::byte port[2];
+    res = co_await buffer->readExactly(port);
+
+    if (!res)
+        co_return tl::unexpected(res.error());
+
+    tl::expected<Target, std::error_code> result = tl::unexpected(
+            make_error_code(std::errc::address_family_not_supported)
+    );
+
+    switch (std::to_integer<size_t>(type[0])) {
+        case 0: {
+            auto hostname = co_await buffer->readLine();
+
+            if (!hostname) {
+                result = tl::unexpected(hostname.error());
                 break;
             }
 
-            case 1: {
-                promise = buffer->readExactly(2)->then([=](nonstd::span<const std::byte> data) {
-                    auto port = ntohs(*(uint16_t *) data.data());
-                    return buffer->readExactly(4)->then([=](nonstd::span<const std::byte, 4> data) -> Target {
-                        aio::net::IPv4Address address = {};
-
-                        address.port = port;
-                        memcpy(address.ip.data(), data.data(), 4);
-
-                        return address;
-                    });
-                });
-
-                break;
-            }
-
-            case 2: {
-                promise = buffer->readExactly(2)->then([=](nonstd::span<const std::byte> data) {
-                    auto port = ntohs(*(uint16_t *) data.data());
-                    return buffer->readExactly(16)->then([=](nonstd::span<const std::byte, 16> data) -> Target {
-                        aio::net::IPv6Address address = {};
-
-                        address.port = port;
-                        memcpy(address.ip.data(), data.data(), 16);
-
-                        return address;
-                    });
-                });
-
-                break;
-            }
-
-            default:
-                promise = zero::async::promise::reject<Target>({-1, "unsupported target type"});
-                break;
+            result = HostAddress{ntohs(*(uint16_t *) port), *hostname};
+            break;
         }
 
-        return promise;
-    });
+        case 1: {
+            std::array<std::byte, 4> ip = {};
+            res = co_await buffer->readExactly(ip);
+
+            if (!res) {
+                result = tl::unexpected(res.error());
+                break;
+            }
+
+            result = asyncio::net::IPv4Address{ntohs(*(uint16_t *) port), ip};
+            break;
+        }
+
+        case 2: {
+            std::array<std::byte, 16> ip = {};
+            res = co_await buffer->readExactly(ip);
+
+            if (!res) {
+                result = tl::unexpected(res.error());
+                break;
+            }
+
+            result = asyncio::net::IPv6Address{ntohs(*(uint16_t *) port), ip};
+            break;
+        }
+    }
+
+    co_return result;
 }
 
 std::string stringify(const Target &target) {
@@ -111,12 +161,12 @@ std::string stringify(const Target &target) {
         }
 
         case 1: {
-            result = aio::net::stringify(std::get<aio::net::IPv4Address>(target));
+            result = std::get<asyncio::net::IPv4Address>(target).string();
             break;
         }
 
         case 2: {
-            result = aio::net::stringify(std::get<aio::net::IPv6Address>(target));
+            result = std::get<asyncio::net::IPv6Address>(target).string();
             break;
         }
     }
