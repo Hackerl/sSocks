@@ -8,7 +8,7 @@
 #include <zero/cmdline.h>
 #include <csignal>
 
-zero::async::coroutine::Task<std::vector<asyncio::net::Address>, std::error_code> resolve(const Target &target) {
+zero::async::coroutine::Task<std::vector<asyncio::net::Address>, std::error_code> resolve(Target target) {
     tl::expected<std::vector<asyncio::net::Address>, std::error_code> result;
 
     switch (target.index()) {
@@ -52,7 +52,128 @@ zero::async::coroutine::Task<std::vector<asyncio::net::Address>, std::error_code
     co_return result;
 }
 
-zero::async::coroutine::Task<void> proxyUDP(const std::shared_ptr<asyncio::net::stream::IBuffer> &local) {
+zero::async::coroutine::Task<void, std::error_code> UDPToRemote(
+        std::shared_ptr<asyncio::net::stream::IBuffer> local,
+        std::shared_ptr<asyncio::net::dgram::Socket> remote
+) {
+    auto clientAddress = local->remoteAddress();
+
+    if (!clientAddress)
+        co_return tl::unexpected(clientAddress.error());
+
+    tl::expected<void, std::error_code> result;
+
+    while (true) {
+        auto target = co_await readTarget(local);
+
+        if (!target) {
+            result = tl::unexpected(target.error());
+            break;
+        }
+
+        std::byte length[4];
+        auto res = co_await local->readExactly(length);
+
+        if (!res) {
+            result = tl::unexpected(res.error());
+            break;
+        }
+
+        std::vector<std::byte> payload(ntohl(*(uint32_t *) length));
+        res = co_await local->readExactly(payload);
+
+        if (!res) {
+            result = tl::unexpected(res.error());
+            break;
+        }
+
+        auto addresses = co_await resolve(*target);
+
+        if (!addresses) {
+            result = tl::unexpected(addresses.error());
+            break;
+        }
+
+        if (addresses->empty()) {
+            result = tl::unexpected<std::error_code>(Error::NO_DNS_RECORD);
+            break;
+        }
+
+        auto address = addresses->front();
+
+        LOG_DEBUG(
+                "UDP packet[%s = %zu => %s]",
+                stringify(*clientAddress).c_str(),
+                payload.size(),
+                stringify(*target).c_str()
+        );
+
+        res = co_await remote->writeTo(payload, address);
+
+        if (!res) {
+            result = tl::unexpected(res.error());
+            break;
+        }
+    }
+
+    co_return result;
+}
+
+zero::async::coroutine::Task<void, std::error_code> UDPToClient(
+        std::shared_ptr<asyncio::net::dgram::Socket> remote,
+        std::shared_ptr<asyncio::net::stream::IBuffer> local
+) {
+    auto clientAddress = local->remoteAddress();
+
+    if (!clientAddress)
+        co_return tl::unexpected(clientAddress.error());
+
+    tl::expected<void, std::error_code> result;
+
+    while (true) {
+        std::byte data[10240];
+        auto res = co_await remote->readFrom(data);
+
+        if (!res) {
+            result = tl::unexpected(res.error());
+            break;
+        }
+
+        auto &[n, from] = *res;
+
+        LOG_DEBUG(
+                "UDP packet[%s <= %zu = %s]",
+                stringify(*clientAddress).c_str(),
+                n,
+                stringify(from).c_str()
+        );
+
+        auto r = from.index() == 0 ?
+                 (co_await writeTarget(local, std::get<asyncio::net::IPv4Address>(from))) :
+                 (co_await writeTarget(local, std::get<asyncio::net::IPv6Address>(from)));
+
+        if (!r) {
+            result = tl::unexpected(r.error());
+            break;
+        }
+
+        auto length = htonl((uint32_t) n);
+
+        local->submit({(const std::byte *) &length, sizeof(length)});
+        local->submit({data, n});
+
+        r = co_await local->drain();
+
+        if (!r) {
+            result = tl::unexpected(r.error());
+            break;
+        }
+    }
+
+    co_return result;
+}
+
+zero::async::coroutine::Task<void> proxyUDP(std::shared_ptr<asyncio::net::stream::IBuffer> local) {
     auto clientAddress = local->remoteAddress();
 
     if (!clientAddress) {
@@ -98,7 +219,10 @@ zero::async::coroutine::Task<void> proxyUDP(const std::shared_ptr<asyncio::net::
     }
 
     auto address = addresses->front();
-    auto remote = asyncio::net::dgram::bind(address.index() == 0 ? "0.0.0.0" : "::", 0);
+    auto remote = asyncio::net::dgram::bind(address.index() == 0 ? "0.0.0.0" : "::", 0)
+            .transform([](asyncio::net::dgram::Socket &&socket) {
+                return std::make_shared<asyncio::net::dgram::Socket>(std::move(socket));
+            });
 
     if (!remote) {
         LOG_ERROR("bind failed[%s]", remote.error().message().c_str());
@@ -112,99 +236,24 @@ zero::async::coroutine::Task<void> proxyUDP(const std::shared_ptr<asyncio::net::
             stringify(*target).c_str()
     );
 
-    result = co_await remote->writeTo(payload, address);
+    result = co_await remote.value()->writeTo(payload, address);
 
     if (!result) {
         LOG_ERROR("write to remote failed[%s]", result.error().message().c_str());
         co_return;
     }
 
-    co_await zero::async::coroutine::race(
-            [&]() -> zero::async::coroutine::Task<void> {
-                while (true) {
-                    auto target = co_await readTarget(local);
+    auto res = co_await zero::async::coroutine::race(UDPToRemote(local, *remote), UDPToClient(*remote, local));
 
-                    if (!target) {
-                        LOG_ERROR("read target failed[%s]", target.error().message().c_str());
-                        break;
-                    }
+    if (!res) {
+        LOG_ERROR("UDP proxy failed[%s]", res.error().message().c_str());
+        co_return;
+    }
 
-                    std::byte length[4];
-                    auto result = co_await local->readExactly(length);
-
-                    if (!result) {
-                        LOG_ERROR("read packet length failed[%s]", result.error().message().c_str());
-                        break;
-                    }
-
-                    std::vector<std::byte> payload(ntohl(*(uint32_t *) length));
-                    result = co_await local->readExactly(payload);
-
-                    if (!result) {
-                        LOG_ERROR("read packet failed[%s]", result.error().message().c_str());
-                        break;
-                    }
-
-                    LOG_DEBUG(
-                            "UDP packet[%s = %zu => %s]",
-                            stringify(*clientAddress).c_str(),
-                            payload.size(),
-                            stringify(*target).c_str()
-                    );
-
-                    result = co_await remote->writeTo(payload, address);
-
-                    if (!result) {
-                        LOG_ERROR("write to remote failed[%s]", result.error().message().c_str());
-                        break;
-                    }
-                }
-            }(),
-            [&]() -> zero::async::coroutine::Task<void> {
-                while (true) {
-                    std::byte data[10240];
-                    auto result = co_await remote->readFrom(data);
-
-                    if (!result) {
-                        LOG_ERROR("read from remote failed[%s]", result.error().message().c_str());
-                        break;
-                    }
-
-                    auto &[n, from] = *result;
-
-                    LOG_DEBUG(
-                            "UDP packet[%s <= %zu = %s]",
-                            stringify(*clientAddress).c_str(),
-                            n,
-                            stringify(from).c_str()
-                    );
-
-                    auto res = from.index() == 0 ?
-                               (co_await writeTarget(local, std::get<asyncio::net::IPv4Address>(from))) :
-                               (co_await writeTarget(local, std::get<asyncio::net::IPv6Address>(from)));
-
-                    if (!res) {
-                        LOG_ERROR("write target failed[%s]", res.error().message().c_str());
-                        break;
-                    }
-
-                    auto length = htonl((uint32_t) n);
-
-                    local->submit({(const std::byte *) &length, sizeof(length)});
-                    local->submit({data, n});
-
-                    res = co_await local->drain();
-
-                    if (!res) {
-                        LOG_ERROR("write to local failed[%s]", res.error().message().c_str());
-                        break;
-                    }
-                }
-            }()
-    );
+    LOG_INFO("UDP proxy finished[%s]", stringify(*clientAddress).c_str());
 }
 
-zero::async::coroutine::Task<void> proxyTCP(const std::shared_ptr<asyncio::net::stream::IBuffer> &local) {
+zero::async::coroutine::Task<void> proxyTCP(std::shared_ptr<asyncio::net::stream::IBuffer> local) {
     auto clientAddress = local->remoteAddress();
 
     if (!clientAddress) {
@@ -233,10 +282,14 @@ zero::async::coroutine::Task<void> proxyTCP(const std::shared_ptr<asyncio::net::
         co_return;
     }
 
-    auto result = co_await asyncio::net::stream::connect(*addresses);
+    auto remote = std::move(co_await asyncio::net::stream::connect(*addresses)).transform(
+            [](asyncio::net::stream::Buffer &&buffer) {
+                return std::make_shared<asyncio::net::stream::Buffer>(std::move(buffer));
+            }
+    );
 
-    if (!result) {
-        LOG_ERROR("connect to remote failed[%s]", result.error().message().c_str());
+    if (!remote) {
+        LOG_ERROR("connect to remote failed[%s]", remote.error().message().c_str());
 
         auto status = {std::byte{1}};
         auto res = co_await local->write(status);
@@ -263,7 +316,7 @@ zero::async::coroutine::Task<void> proxyTCP(const std::shared_ptr<asyncio::net::
         co_return;
     }
 
-    co_await zero::async::coroutine::race(asyncio::copy(*local, **result), asyncio::copy(**result, *local));
+    co_await zero::async::coroutine::race(asyncio::copy(local, *remote), asyncio::copy(*remote, local));
 }
 
 zero::async::coroutine::Task<void> handle(std::shared_ptr<asyncio::net::stream::IBuffer> buffer) {
@@ -276,11 +329,28 @@ zero::async::coroutine::Task<void> handle(std::shared_ptr<asyncio::net::stream::
     }
 
     if (std::to_integer<int>(type[0]) == 0) {
-        co_await proxyTCP(buffer);
+        co_await proxyTCP(std::move(buffer));
         co_return;
     }
 
-    co_await proxyUDP(buffer);
+    co_await proxyUDP(std::move(buffer));
+}
+
+zero::async::coroutine::Task<void, std::error_code> serve(asyncio::net::ssl::stream::Listener listener) {
+    tl::expected<void, std::error_code> result;
+
+    while (true) {
+        auto buffer = std::move(co_await listener.accept());
+
+        if (!buffer) {
+            result = tl::unexpected(buffer.error());
+            break;
+        }
+
+        handle(std::make_shared<asyncio::net::ssl::stream::Buffer>(std::move(*buffer)));
+    }
+
+    co_return result;
 }
 
 int main(int argc, char **argv) {
@@ -306,7 +376,7 @@ int main(int argc, char **argv) {
     }
 #endif
 
-#ifdef __unix__
+#if __unix__ || __APPLE__
     signal(SIGPIPE, SIG_IGN);
 #endif
 
@@ -345,24 +415,7 @@ int main(int argc, char **argv) {
             co_return;
         }
 
-        co_await zero::async::coroutine::allSettled(
-                [&]() -> zero::async::coroutine::Task<void> {
-                    co_await signal->on();
-                    listener->close();
-                }(),
-                [&]() -> zero::async::coroutine::Task<void> {
-                    while (true) {
-                        auto result = co_await listener->accept();
-
-                        if (!result) {
-                            LOG_ERROR("accept failed[%s]", result.error().message().c_str());
-                            break;
-                        }
-
-                        handle(*result);
-                    }
-                }()
-        );
+        co_await zero::async::coroutine::race(signal->on(), serve(std::move(*listener)));
     });
 
 #ifdef _WIN32

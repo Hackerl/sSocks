@@ -29,6 +29,18 @@ std::string Category::message(int value) const {
             msg = "auth failed";
             break;
 
+        case FORBIDDEN_ADDRESS:
+            msg = "forbidden address";
+            break;
+
+        case INVALID_UDP_PACKET:
+            msg = "invalid UDP packet";
+            break;
+
+        case NO_DNS_RECORD:
+            msg = "no dns record";
+            break;
+
         default:
             msg = "unknown";
             break;
@@ -46,51 +58,8 @@ std::error_code make_error_code(Error e) {
     return {static_cast<int>(e), category()};
 }
 
-zero::async::coroutine::Task<void, std::error_code>
-writeTarget(const std::shared_ptr<asyncio::net::stream::IBuffer> &buffer, const Target &target) {
-    switch (target.index()) {
-        case 0: {
-            auto address = std::get<HostAddress>(target);
-            auto port = htons(address.port);
-            auto type = {std::byte{0}};
-
-            buffer->submit(type);
-            buffer->submit({(const std::byte *) &port, sizeof(port)});
-            buffer->writeLine(address.hostname);
-
-            break;
-        }
-
-        case 1: {
-            auto address = std::get<asyncio::net::IPv4Address>(target);
-            auto port = htons(address.port);
-            auto type = {std::byte{1}};
-
-            buffer->submit(type);
-            buffer->submit({(const std::byte *) &port, sizeof(port)});
-            buffer->submit(address.ip);
-
-            break;
-        }
-
-        case 2: {
-            auto address = std::get<asyncio::net::IPv6Address>(target);
-            auto port = htons(address.port);
-            auto type = {std::byte{2}};
-
-            buffer->submit(type);
-            buffer->submit({(const std::byte *) &port, sizeof(port)});
-            buffer->submit(address.ip);
-
-            break;
-        }
-    }
-
-    co_return co_await buffer->drain();
-}
-
 zero::async::coroutine::Task<Target, std::error_code>
-readTarget(const std::shared_ptr<asyncio::net::stream::IBuffer> &buffer) {
+readTarget(std::shared_ptr<asyncio::net::stream::IBuffer> buffer) {
     std::byte type[1];
     auto res = co_await buffer->readExactly(type);
 
@@ -148,6 +117,49 @@ readTarget(const std::shared_ptr<asyncio::net::stream::IBuffer> &buffer) {
     }
 
     co_return result;
+}
+
+zero::async::coroutine::Task<void, std::error_code>
+writeTarget(std::shared_ptr<asyncio::net::stream::IBuffer> buffer, Target target) {
+    switch (target.index()) {
+        case 0: {
+            auto address = std::get<HostAddress>(target);
+            auto port = htons(address.port);
+            auto type = {std::byte{0}};
+
+            buffer->submit(type);
+            buffer->submit({(const std::byte *) &port, sizeof(port)});
+            buffer->writeLine(address.hostname);
+
+            break;
+        }
+
+        case 1: {
+            auto address = std::get<asyncio::net::IPv4Address>(target);
+            auto port = htons(address.port);
+            auto type = {std::byte{1}};
+
+            buffer->submit(type);
+            buffer->submit({(const std::byte *) &port, sizeof(port)});
+            buffer->submit(address.ip);
+
+            break;
+        }
+
+        case 2: {
+            auto address = std::get<asyncio::net::IPv6Address>(target);
+            auto port = htons(address.port);
+            auto type = {std::byte{2}};
+
+            buffer->submit(type);
+            buffer->submit({(const std::byte *) &port, sizeof(port)});
+            buffer->submit(address.ip);
+
+            break;
+        }
+    }
+
+    co_return co_await buffer->drain();
 }
 
 std::string stringify(const Target &target) {

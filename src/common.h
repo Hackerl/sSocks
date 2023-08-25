@@ -8,7 +8,10 @@ enum Error {
     UNSUPPORTED_AUTH_VERSION,
     UNSUPPORTED_AUTH_METHOD,
     UNSUPPORTED_ADDRESS_TYPE,
-    AUTH_FAILED
+    AUTH_FAILED,
+    FORBIDDEN_ADDRESS,
+    INVALID_UDP_PACKET,
+    NO_DNS_RECORD
 };
 
 class Category : public std::error_category {
@@ -36,10 +39,9 @@ using Target = std::variant<HostAddress, asyncio::net::IPv4Address, asyncio::net
 
 std::string stringify(const Target &target);
 
-zero::async::coroutine::Task<Target, std::error_code>
-readTarget(const std::shared_ptr<asyncio::net::stream::IBuffer> &buffer);
+zero::async::coroutine::Task<Target, std::error_code> readTarget(std::shared_ptr<asyncio::net::stream::IBuffer> buffer);
 
 zero::async::coroutine::Task<void, std::error_code>
-writeTarget(const std::shared_ptr<asyncio::net::stream::IBuffer> &buffer, const Target &target);
+writeTarget(std::shared_ptr<asyncio::net::stream::IBuffer> buffer, Target target);
 
 #endif //SOCKS_COMMON_H

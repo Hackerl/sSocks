@@ -3,7 +3,7 @@
     {
       "kind": "git",
       "repository": "https://github.com/Hackerl/vcpkg-registry",
-      "baseline": "8964281abff0333e7273e87225195c8b6b1509e5",
+      "baseline": "271a4a904611cfbcf66316242673732e1a146797",
       "reference": "dev",
       "packages": [
         "asyncio",
