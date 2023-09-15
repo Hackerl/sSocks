@@ -13,11 +13,11 @@ struct User {
 };
 
 template<>
-std::optional<User> zero::convert<User>(std::string_view str) {
-    std::vector<std::string> tokens = zero::strings::split(str, ":");
+tl::expected<User, std::error_code> zero::fromCommandLine(const std::string &str) {
+    auto tokens = zero::strings::split(str, ":");
 
     if (tokens.size() != 2)
-        return std::nullopt;
+        return tl::unexpected(make_error_code(std::errc::invalid_argument));
 
     return User{zero::strings::trim(tokens[0]), zero::strings::trim(tokens[1])};
 }
