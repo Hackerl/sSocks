@@ -1,11 +1,17 @@
 #include "common.h"
+#include <asyncio/binary.h>
 #include <asyncio/net/ssl.h>
 #include <asyncio/net/dgram.h>
 #include <asyncio/ev/signal.h>
 #include <asyncio/event_loop.h>
 #include <zero/log.h>
+#include <zero/defer.h>
 #include <zero/cmdline.h>
 #include <csignal>
+
+#ifndef _WIN32
+#include <arpa/inet.h>
+#endif
 
 struct User {
     std::string username;
@@ -13,13 +19,13 @@ struct User {
 };
 
 template<>
-tl::expected<User, std::error_code> zero::fromCommandLine(const std::string &str) {
-    auto tokens = zero::strings::split(str, ":");
+tl::expected<User, std::error_code> zero::scan(const std::string_view input) {
+    const auto tokens = strings::split(input, ":");
 
     if (tokens.size() != 2)
         return tl::unexpected(make_error_code(std::errc::invalid_argument));
 
-    return User{zero::strings::trim(tokens[0]), zero::strings::trim(tokens[1])};
+    return User{strings::trim(tokens[0]), strings::trim(tokens[1])};
 }
 
 bool matchSource(const asyncio::net::Address &source, const asyncio::net::Address &from) {
@@ -27,228 +33,134 @@ bool matchSource(const asyncio::net::Address &source, const asyncio::net::Addres
         return false;
 
     if (source.index() == 0) {
-        auto sourceAddress = std::get<asyncio::net::IPv4Address>(source);
-        auto fromAddress = std::get<asyncio::net::IPv4Address>(from);
+        const auto [sourcePort, sourceIP] = std::get<asyncio::net::IPv4Address>(source);
+        const auto [fromPort, fromIP] = std::get<asyncio::net::IPv4Address>(from);
 
-        if (sourceAddress.port != 0 && sourceAddress.port != fromAddress.port)
+        if (sourcePort != 0 && sourcePort != fromPort)
             return false;
 
-        if (std::all_of(
-                sourceAddress.ip.begin(),
-                sourceAddress.ip.end(),
-                [](const auto &byte) {
-                    return byte == std::byte{0};
-                }
-        ))
+        if (std::ranges::all_of(sourceIP, [](const auto &b) { return b == std::byte{0}; }))
             return true;
 
-        return std::equal(sourceAddress.ip.begin(), sourceAddress.ip.end(), fromAddress.ip.begin());
+        return sourceIP == fromIP;
     }
 
-    auto sourceAddress = std::get<asyncio::net::IPv6Address>(source);
-    auto fromAddress = std::get<asyncio::net::IPv6Address>(from);
+    const auto &[sourcePort, sourceIP, sourceZone]  = std::get<asyncio::net::IPv6Address>(source);
+    const auto &[fromPort, fromIP, fromZone] = std::get<asyncio::net::IPv6Address>(from);
 
-    if (sourceAddress.port != 0 && sourceAddress.port != fromAddress.port)
+    if (sourcePort != 0 && sourcePort != fromPort)
         return false;
 
-    if (std::all_of(
-            sourceAddress.ip.begin(),
-            sourceAddress.ip.end(),
-            [](const auto &byte) {
-                return byte == std::byte{0};
-            }
-    ))
+    if (std::ranges::all_of(sourceIP, [](const auto &b) { return b == std::byte{0}; }))
         return true;
 
-    return std::equal(sourceAddress.ip.begin(), sourceAddress.ip.end(), fromAddress.ip.begin());
+    return sourceIP == fromIP;
 }
 
 zero::async::coroutine::Task<std::tuple<int, Target>, std::error_code>
-readRequest(std::shared_ptr<asyncio::net::stream::IBuffer> buffer) {
+readRequest(asyncio::IBufReader &reader) {
     std::byte header[4];
-    auto res = co_await buffer->readExactly(header);
-
-    if (!res)
-        co_return tl::unexpected(res.error());
+    CO_TRY(co_await reader.readExactly(header));
 
     if (std::to_integer<int>(header[0]) != 5)
-        co_return tl::unexpected(Error::UNSUPPORTED_VERSION);
+        co_return tl::unexpected(UNSUPPORTED_VERSION);
 
-    tl::expected<std::tuple<int, Target>, std::error_code> result;
+    const int command = std::to_integer<int>(header[1]);
 
-    int command = std::to_integer<int>(header[1]);
-    int type = std::to_integer<int>(header[3]);
-
-    switch (type) {
+    switch (std::to_integer<int>(header[3])) {
         case 1: {
             std::array<std::byte, 4> ip = {};
-            res = co_await buffer->readExactly(ip);
+            CO_TRY(co_await reader.readExactly(ip));
+            const auto port = CO_TRY(co_await asyncio::binary::readBE<unsigned short>(reader));
 
-            if (!res) {
-                result = tl::unexpected(res.error());
-                break;
-            }
-
-            std::byte port[2];
-            res = co_await buffer->readExactly(port);
-
-            if (!res) {
-                result = tl::unexpected(res.error());
-                break;
-            }
-
-            result = {command, asyncio::net::IPv4Address{ntohs(*(uint16_t *) port), ip}};
-            break;
+            co_return std::tuple<int, Target>{command, asyncio::net::IPv4Address{*port, ip}};
         }
 
         case 3: {
             std::byte length[1];
-            res = co_await buffer->readExactly(length);
+            CO_TRY(co_await reader.readExactly(length));
 
-            if (!res) {
-                result = tl::unexpected(res.error());
-                break;
-            }
+            std::string host;
+            host.resize(std::to_integer<std::size_t>(length[0]));
 
-            std::vector<std::byte> host(std::to_integer<size_t>(length[0]));
-            res = co_await buffer->readExactly(host);
+            CO_TRY(co_await reader.readExactly(std::as_writable_bytes(std::span{host})));
+            const auto port = CO_TRY(co_await asyncio::binary::readBE<unsigned short>(reader));
 
-            if (!res) {
-                result = tl::unexpected(res.error());
-                break;
-            }
-
-            std::byte port[2];
-            res = co_await buffer->readExactly(port);
-
-            if (!res) {
-                result = tl::unexpected(res.error());
-                break;
-            }
-
-            result = {command, HostAddress{ntohs(*(uint16_t *) port), {(const char *) host.data(), host.size()}}};
-            break;
+            co_return std::tuple<int, Target>{command, HostAddress{*port, std::move(host)}};
         }
 
         case 4: {
             std::array<std::byte, 16> ip = {};
-            res = co_await buffer->readExactly(ip);
+            CO_TRY(co_await reader.readExactly(ip));
+            const auto port = CO_TRY(co_await asyncio::binary::readBE<unsigned short>(reader));
 
-            if (!res) {
-                result = tl::unexpected(res.error());
-                break;
-            }
-
-            std::byte port[2];
-            res = co_await buffer->readExactly(port);
-
-            if (!res) {
-                result = tl::unexpected(res.error());
-                break;
-            }
-
-            result = {command, asyncio::net::IPv6Address{ntohs(*(uint16_t *) port), ip}};
-            break;
+            co_return std::tuple<int, Target>{command, asyncio::net::IPv6Address{*port, ip}};
         }
 
         default:
-            result = tl::unexpected<std::error_code>(Error::UNSUPPORTED_ADDRESS_TYPE);
-            break;
+            co_return tl::unexpected<std::error_code>(UNSUPPORTED_ADDRESS_TYPE);
     }
-
-    co_return result;
 }
 
-zero::async::coroutine::Task<User, std::error_code> readUser(std::shared_ptr<asyncio::net::stream::IBuffer> buffer) {
+zero::async::coroutine::Task<User, std::error_code> readUser(asyncio::IBufReader &reader) {
     std::byte version[1];
-    auto result = co_await buffer->readExactly(version);
-
-    if (!result)
-        co_return tl::unexpected(result.error());
+    CO_TRY(co_await reader.readExactly(version));
 
     if (std::to_integer<int>(version[0]) != 1)
-        co_return tl::unexpected(Error::UNSUPPORTED_AUTH_VERSION);
+        co_return tl::unexpected(UNSUPPORTED_AUTH_VERSION);
 
     std::byte length[1];
-    result = co_await buffer->readExactly(length);
+    CO_TRY(co_await reader.readExactly(length));
 
-    if (!result)
-        co_return tl::unexpected(result.error());
+    std::string username;
+    username.resize(std::to_integer<std::size_t>(length[0]));
 
-    std::vector<std::byte> username(std::to_integer<size_t>(length[0]));
-    result = co_await buffer->readExactly(username);
+    CO_TRY(co_await reader.readExactly(std::as_writable_bytes(std::span{username})));
+    CO_TRY(co_await reader.readExactly(length));
 
-    if (!result)
-        co_return tl::unexpected(result.error());
+    std::string password;
+    password.resize(std::to_integer<std::size_t>(length[0]));
 
-    result = co_await buffer->readExactly(length);
+    CO_TRY(co_await reader.readExactly(std::as_writable_bytes(std::span{password})));
 
-    if (!result)
-        co_return tl::unexpected(result.error());
-
-    std::vector<std::byte> password(std::to_integer<size_t>(length[0]));
-    result = co_await buffer->readExactly(password);
-
-    if (!result)
-        co_return tl::unexpected(result.error());
-
-    co_return User{
-            {(const char *) username.data(), username.size()},
-            {(const char *) password.data(), password.size()}
-    };
+    co_return User{std::move(username), std::move(password)};
 }
 
-zero::async::coroutine::Task<void, std::error_code>
-handshake(std::shared_ptr<asyncio::net::stream::IBuffer> buffer, std::optional<User> account) {
+zero::async::coroutine::Task<void, std::error_code> handshake(asyncio::IBuffer &buffer, std::optional<User> account) {
     std::byte header[2];
-    auto result = co_await buffer->readExactly(header);
+    CO_TRY(co_await buffer.readExactly(header));
 
-    if (!result)
-        co_return tl::unexpected(result.error());
-
-    std::vector<std::byte> methods(std::to_integer<size_t>(header[1]));
-
-    result = co_await buffer->readExactly(methods);
-
-    if (!result)
-        co_return tl::unexpected(result.error());
+    std::vector<std::byte> methods(std::to_integer<std::size_t>(header[1]));
+    CO_TRY(co_await buffer.readExactly(methods));
 
     if (!account) {
-        auto response = {std::byte{5}, std::byte{0}};
-        co_return co_await buffer->write(response);
+        constexpr std::array response = {std::byte{5}, std::byte{0}};
+        co_return co_await buffer.writeAll(response);
     }
 
-    if (std::find(methods.begin(), methods.end(), std::byte{2}) == methods.end()) {
-        auto response = {std::byte{5}, std::byte{0xff}};
-        co_await buffer->write(response);
-        co_return tl::unexpected(Error::UNSUPPORTED_AUTH_METHOD);
+    if (std::ranges::find(methods, std::byte{2}) == methods.end()) {
+        constexpr std::array response = {std::byte{5}, std::byte{0xff}};
+        CO_TRY(co_await buffer.writeAll(response));
+        co_return tl::unexpected(UNSUPPORTED_AUTH_METHOD);
     }
 
-    std::array<std::byte, 2> response = {std::byte{5}, std::byte{2}};
-    result = co_await buffer->write(response);
+    std::array response = {std::byte{5}, std::byte{2}};
+    CO_TRY(co_await buffer.writeAll(response));
 
-    if (!result)
-        co_return tl::unexpected(result.error());
-
-    auto user = co_await readUser(buffer);
-
-    if (!user) {
-        response = {std::byte{1}, std::byte{1}};
-        co_await buffer->write(response);
-        co_return tl::unexpected(user.error());
-    }
+    const auto user = CO_TRY(co_await readUser(buffer));
+    LOG_INFO("auth user: {}", user->username);
 
     if (user->username != account->username || user->password != account->password) {
         response = {std::byte{1}, std::byte{1}};
-        co_await buffer->write(response);
+        CO_TRY(co_await buffer.writeAll(response));
         co_return tl::unexpected(AUTH_FAILED);
     }
 
     response = {std::byte{1}, std::byte{0}};
-    co_return co_await buffer->write(response);
+    co_return co_await buffer.writeAll(response);
 }
 
-std::optional<std::tuple<Target, std::span<const std::byte>>> unpack(std::span<const std::byte> data) {
+std::optional<std::tuple<Target, std::span<const std::byte>>> unpack(const std::span<const std::byte> data) {
     if (data[2] != std::byte{0}) {
         LOG_ERROR("fragmentation is not supported");
         return std::nullopt;
@@ -260,23 +172,22 @@ std::optional<std::tuple<Target, std::span<const std::byte>>> unpack(std::span<c
         case 1: {
             asyncio::net::IPv4Address address = {};
 
-            address.port = ntohs(*(uint16_t *) (data.data() + 8));
+            address.port = ntohs(*reinterpret_cast<const std::uint16_t *>(data.data() + 8));
             memcpy(address.ip.data(), data.subspan<4, 4>().data(), 4);
 
             packet = {address, data.subspan(10)};
-
             break;
         }
 
         case 3: {
-            auto length = std::to_integer<size_t>(data[4]);
+            const auto length = std::to_integer<std::size_t>(data[4]);
 
             packet = {
-                    HostAddress{
-                            ntohs(*(uint16_t *) (data.data() + 5 + length)),
-                            {(const char *) data.data() + 5, length}
-                    },
-                    data.subspan(7 + length)
+                HostAddress{
+                    ntohs(*reinterpret_cast<const std::uint16_t *>(data.data() + 5 + length)),
+                    {reinterpret_cast<const char *>(data.data()) + 5, length}
+                },
+                data.subspan(7 + length)
             };
 
             break;
@@ -285,11 +196,10 @@ std::optional<std::tuple<Target, std::span<const std::byte>>> unpack(std::span<c
         case 4: {
             asyncio::net::IPv6Address address = {};
 
-            address.port = ntohs(*(uint16_t *) (data.data() + 20));
+            address.port = ntohs(*reinterpret_cast<const std::uint16_t *>(data.data() + 20));
             memcpy(address.ip.data(), data.subspan<4, 16>().data(), 16);
 
             packet = {address, data.subspan(22)};
-
             break;
         }
 
@@ -300,230 +210,127 @@ std::optional<std::tuple<Target, std::span<const std::byte>>> unpack(std::span<c
     return packet;
 }
 
-zero::async::coroutine::Task<asyncio::net::Address, std::error_code> setupUDP(
-        std::shared_ptr<asyncio::net::dgram::Socket> local,
-        std::shared_ptr<asyncio::net::stream::IBuffer> remote,
-        asyncio::net::Address source
-) {
+zero::async::coroutine::Task<asyncio::net::Address, std::error_code>
+setupUDP(asyncio::net::dgram::Socket &local, asyncio::IBuffer &remote, asyncio::net::Address source) {
     std::byte data[10240];
-    auto result = co_await local->readFrom(data);
-
-    if (!result)
-        co_return tl::unexpected(result.error());
-
-    auto &[n, from] = *result;
+    const auto result = CO_TRY(co_await local.readFrom(data));
+    const auto &[n, from] = *result;
 
     if (!matchSource(source, from))
-        co_return tl::unexpected(Error::FORBIDDEN_ADDRESS);
+        co_return tl::unexpected(FORBIDDEN_ADDRESS);
 
-    auto packet = unpack({data, n});
+    const auto packet = unpack({data, n});
 
     if (!packet)
-        co_return tl::unexpected(Error::INVALID_UDP_PACKET);
+        co_return tl::unexpected(INVALID_UDP_PACKET);
 
     const auto &[target, payload] = *packet;
 
-    LOG_DEBUG(
-            "UDP packet[%s = %zu => %s]",
-            stringify(from).c_str(),
-            payload.size(),
-            stringify(target).c_str()
-    );
+    LOG_DEBUG("UDP packet: {} = {} => {}", from, payload.size(), target);
 
-    auto res = co_await writeTarget(remote, target);
-
-    if (!res)
-        co_return tl::unexpected(res.error());
-
-    auto length = htonl((uint32_t) payload.size());
-
-    remote->submit({(const std::byte *) &length, sizeof(length)});
-    remote->submit(payload);
-
-    res = co_await remote->drain();
-
-    if (!res)
-        co_return tl::unexpected(res.error());
+    CO_TRY(co_await writeTarget(remote, target));
+    CO_TRY(co_await asyncio::binary::writeBE(remote, static_cast<std::uint32_t>(payload.size())));
+    CO_TRY(co_await remote.writeAll(payload));
+    CO_TRY(co_await remote.flush());
 
     co_return from;
 }
 
-zero::async::coroutine::Task<void, std::error_code> UDPToRemote(
-        std::shared_ptr<asyncio::net::dgram::Socket> local,
-        std::shared_ptr<asyncio::net::stream::IBuffer> remote,
-        asyncio::net::Address client
+zero::async::coroutine::Task<void, std::error_code>
+UDPToRemote(
+    std::shared_ptr<asyncio::net::dgram::Socket> local,
+    std::shared_ptr<asyncio::IBufWriter> writer,
+    asyncio::net::Address client
 ) {
-    tl::expected<void, std::error_code> result;
-
     while (true) {
         std::byte data[10240];
-        auto res = co_await local->readFrom(data);
 
-        if (!res) {
-            result = tl::unexpected(res.error());
-            break;
-        }
+        const auto res = CO_TRY(co_await local->readFrom(data));
+        const auto &[n, from] = *res;
 
-        auto &[n, from] = *res;
+        if (from != client)
+            co_return tl::unexpected(FORBIDDEN_ADDRESS);
 
-        if (from != client) {
-            result = tl::unexpected<std::error_code>(Error::FORBIDDEN_ADDRESS);
-            break;
-        }
+        const auto packet = unpack({data, n});
 
-        auto packet = unpack({data, n});
-
-        if (!packet) {
-            result = tl::unexpected<std::error_code>(Error::INVALID_UDP_PACKET);
-            break;
-        }
+        if (!packet)
+            co_return tl::unexpected(INVALID_UDP_PACKET);
 
         const auto &[target, payload] = *packet;
+        LOG_DEBUG("UDP packet: {} = {} => {}", from, payload.size(), target);
 
-        LOG_DEBUG(
-                "UDP packet[%s = %zu => %s]",
-                stringify(from).c_str(),
-                payload.size(),
-                stringify(target).c_str()
-        );
-
-        auto r = co_await writeTarget(remote, target);
-
-        if (!r) {
-            result = tl::unexpected(r.error());
-            break;
-        }
-
-        auto length = htonl((uint32_t) payload.size());
-
-        remote->submit({(const std::byte *) &length, sizeof(length)});
-        remote->submit(payload);
-
-        r = co_await remote->drain();
-
-        if (!r) {
-            result = tl::unexpected(r.error());
-            break;
-        }
+        CO_TRY(co_await writeTarget(*writer, target));
+        CO_TRY(co_await asyncio::binary::writeBE(*writer, static_cast<std::uint32_t>(payload.size())));
+        CO_TRY(co_await writer->writeAll(payload));
+        CO_TRY(co_await writer->flush());
     }
-
-    co_return result;
 }
 
-zero::async::coroutine::Task<void, std::error_code> UDPToClient(
-        std::shared_ptr<asyncio::net::stream::IBuffer> remote,
-        std::shared_ptr<asyncio::net::dgram::Socket> local,
-        asyncio::net::Address client
+zero::async::coroutine::Task<void, std::error_code>
+UDPToClient(
+    std::shared_ptr<asyncio::IBufReader> reader,
+    std::shared_ptr<asyncio::net::dgram::Socket> local,
+    asyncio::net::Address client
 ) {
-    tl::expected<void, std::error_code> result;
-
     while (true) {
-        auto target = co_await readTarget(remote);
+        const auto target = CO_TRY(co_await readTarget(*reader));
+        const auto length = CO_TRY(co_await asyncio::binary::readBE<std::uint32_t>(*reader));
 
-        if (!target) {
-            result = tl::unexpected(target.error());
-            break;
-        }
+        std::vector<std::byte> payload(*length);
+        CO_TRY(co_await reader->readExactly(payload));
 
-        std::byte length[4];
-        auto res = co_await remote->readExactly(length);
+        LOG_DEBUG("UDP packet: {} <= {} = {}", client, payload.size(), *target);
 
-        if (!res) {
-            result = tl::unexpected(res.error());
-            break;
-        }
-
-        std::vector<std::byte> payload(ntohl(*(uint32_t *) length));
-        res = co_await remote->readExactly(payload);
-
-        if (!res) {
-            result = tl::unexpected(res.error());
-            break;
-        }
-
-        LOG_DEBUG(
-                "UDP packet[%s <= %zu = %s]",
-                stringify(client).c_str(),
-                payload.size(),
-                stringify(*target).c_str()
-        );
-
-        std::vector<std::byte> response = {
-                std::byte{0}, std::byte{0},
-                std::byte{0}
+        std::vector response = {
+            std::byte{0}, std::byte{0},
+            std::byte{0}
         };
 
         if (target->index() == 1) {
             response.push_back(std::byte{1});
 
-            auto ipv4Address = std::get<asyncio::net::IPv4Address>(*target);
-            unsigned short port = htons(ipv4Address.port);
+            const auto [port, ip] = std::get<asyncio::net::IPv4Address>(*target);
+            unsigned short p = htons(port);
 
+            response.insert(response.end(), ip.begin(), ip.end());
             response.insert(
-                    response.end(),
-                    ipv4Address.ip.begin(),
-                    ipv4Address.ip.end()
-            );
-
-            response.insert(
-                    response.end(),
-                    (const std::byte *) &port,
-                    (const std::byte *) &port + sizeof(unsigned short)
+                response.end(),
+                reinterpret_cast<const std::byte *>(&p),
+                reinterpret_cast<const std::byte *>(&p) + sizeof(unsigned short)
             );
 
             response.insert(response.end(), payload.begin(), payload.end());
-            auto r = co_await local->writeTo(response, client);
-
-            if (!r) {
-                result = tl::unexpected(r.error());
-                break;
-            }
+            CO_TRY(co_await local->writeTo(response, client));
 
             continue;
         }
 
         response.push_back(std::byte{4});
 
-        auto ipv6Address = std::get<asyncio::net::IPv6Address>(*target);
-        unsigned short port = htons(ipv6Address.port);
+        const auto &[port, ip, zone] = std::get<asyncio::net::IPv6Address>(*target);
+        unsigned short p = htons(port);
 
+        response.insert(response.end(), ip.begin(), ip.end());
         response.insert(
-                response.end(),
-                ipv6Address.ip.begin(),
-                ipv6Address.ip.end()
-        );
-
-        response.insert(
-                response.end(),
-                (const std::byte *) &port,
-                (const std::byte *) &port + sizeof(unsigned short)
+            response.end(),
+            reinterpret_cast<const std::byte *>(&p),
+            reinterpret_cast<const std::byte *>(&p) + sizeof(unsigned short)
         );
 
         response.insert(response.end(), payload.begin(), payload.end());
-        auto r = co_await local->writeTo(response, client);
-
-        if (!r) {
-            result = tl::unexpected(r.error());
-            break;
-        }
+        CO_TRY(co_await local->writeTo(response, client));
     }
-
-    co_return result;
 }
 
-zero::async::coroutine::Task<void> proxyUDP(
-        std::shared_ptr<asyncio::net::stream::IBuffer> buffer,
-        std::shared_ptr<asyncio::net::stream::IBuffer> remote,
-        asyncio::net::Address source
+zero::async::coroutine::Task<void, std::error_code>
+proxyUDP(
+    asyncio::net::stream::Buffer buffer,
+    asyncio::net::ssl::stream::Buffer remote,
+    asyncio::net::Address source
 ) {
-    auto localAddress = buffer->localAddress();
+    const auto localAddress = CO_TRY(buffer.localAddress());
+    const bool isIPv4 = localAddress->index() == 0;
 
-    if (!localAddress) {
-        LOG_ERROR("get local address failed[%s]", localAddress.error().message().c_str());
-        co_return;
-    }
-
-    bool isIPv4 = localAddress->index() == 0;
     std::optional<asyncio::net::Address> bindAddress;
 
     if (isIPv4)
@@ -531,207 +338,114 @@ zero::async::coroutine::Task<void> proxyUDP(
     else
         bindAddress = asyncio::net::IPv6Address{0, std::get<asyncio::net::IPv6Address>(*localAddress).ip};
 
-    auto local = asyncio::net::dgram::bind(*bindAddress).transform([](asyncio::net::dgram::Socket &&socket) {
-        return std::make_shared<asyncio::net::dgram::Socket>(std::move(socket));
-    });
+    auto local = CO_TRY(asyncio::net::dgram::bind(*bindAddress));
+    const auto address = CO_TRY(local->localAddress());
 
-    if (!local) {
-        LOG_ERROR("dgram socket bind failed[%s]", local.error().message().c_str());
-        co_return;
-    }
-
-    auto address = local.value()->localAddress();
-
-    if (!address) {
-        LOG_ERROR("get local address failed[%s]", localAddress.error().message().c_str());
-        co_return;
-    }
-
-    std::vector<std::byte> response = {std::byte{5}, std::byte{0}, std::byte{0}};
+    std::vector response = {std::byte{5}, std::byte{0}, std::byte{0}};
 
     if (isIPv4) {
         response.push_back(std::byte{1});
 
-        auto ipv4Address = std::get<asyncio::net::IPv4Address>(*address);
-        unsigned short bindPort = htons(ipv4Address.port);
+        const auto [port, ip] = std::get<asyncio::net::IPv4Address>(*address);
+        unsigned short bindPort = htons(port);
 
-        response.insert(response.end(), ipv4Address.ip.begin(), ipv4Address.ip.end());
+        response.insert(response.end(), ip.begin(), ip.end());
         response.insert(
-                response.end(),
-                (const std::byte *) &bindPort,
-                (const std::byte *) &bindPort + sizeof(unsigned short)
+            response.end(),
+            reinterpret_cast<const std::byte *>(&bindPort),
+            reinterpret_cast<const std::byte *>(&bindPort) + sizeof(unsigned short)
         );
     } else {
         response.push_back(std::byte{4});
 
-        auto ipv6Address = std::get<asyncio::net::IPv6Address>(*address);
-        unsigned short bindPort = htons(ipv6Address.port);
+        const auto &[port, ip, zone] = std::get<asyncio::net::IPv6Address>(*address);
+        unsigned short bindPort = htons(port);
 
-        response.insert(response.end(), ipv6Address.ip.begin(), ipv6Address.ip.end());
+        response.insert(response.end(), ip.begin(), ip.end());
         response.insert(
-                response.end(),
-                (const std::byte *) &bindPort,
-                (const std::byte *) &bindPort + sizeof(unsigned short)
+            response.end(),
+            reinterpret_cast<const std::byte *>(&bindPort),
+            reinterpret_cast<const std::byte *>(&bindPort) + sizeof(unsigned short)
         );
     }
 
-    auto result = co_await buffer->write(response);
+    CO_TRY(co_await buffer.writeAll(response));
 
-    if (!result) {
-        LOG_ERROR("write response failed[%s]", result.error().message().c_str());
-        co_return;
-    }
+    constexpr std::array type = {std::byte{1}};
+    CO_TRY(co_await remote.writeAll(type));
 
-    auto type = {std::byte{1}};
-    result = co_await remote->write(type);
+    const auto client = CO_TRY(co_await setupUDP(*local, remote, source));
 
-    if (!result) {
-        LOG_ERROR("write address type failed[%s]", result.error().message().c_str());
-        co_return;
-    }
+    LOG_INFO("UDP client[{}]", *client);
+    DEFER(LOG_INFO("UDP proxy finished: {}", *client));
 
-    auto client = co_await setupUDP(*local, remote, source);
+    const auto localSocket = std::make_shared<asyncio::net::dgram::Socket>(std::move(*local));
+    const auto remoteBuffer = std::make_shared<asyncio::net::ssl::stream::Buffer>(std::move(remote));
 
-    if (!client) {
-        LOG_ERROR("setup UDP proxy failed[%s]", client.error().message().c_str());
-        co_return;
-    }
-
-    LOG_INFO("UDP client[%s]", stringify(*client).c_str());
-
-    auto res = co_await zero::async::coroutine::race(
-            buffer->waitClosed(),
-            UDPToRemote(*local, remote, *client),
-            UDPToClient(remote, *local, *client)
+    co_return co_await race(
+        [](auto buf) -> zero::async::coroutine::Task<void, std::error_code> {
+            while (true) {
+                std::byte data[10240];
+                CO_TRY(co_await buf.read(data));
+            }
+        }(std::move(buffer)),
+        UDPToRemote(localSocket, remoteBuffer, *client),
+        UDPToClient(remoteBuffer, localSocket, *client)
     );
-
-    if (!res) {
-        LOG_ERROR("UDP proxy failed[%s]", res.error().message().c_str());
-        co_return;
-    }
-
-    LOG_INFO("UDP proxy finished[%s]", stringify(*client).c_str());
 }
 
-zero::async::coroutine::Task<void> proxyTCP(
-        std::shared_ptr<asyncio::net::stream::IBuffer> local,
-        std::shared_ptr<asyncio::net::stream::IBuffer> remote,
-        Target target
-) {
-    auto clientAddress = local->remoteAddress();
+zero::async::coroutine::Task<void, std::error_code>
+proxyTCP(asyncio::net::stream::Buffer local, asyncio::net::ssl::stream::Buffer remote, Target target) {
+    const auto clientAddress = CO_TRY(local.remoteAddress());
+    LOG_INFO("TCP proxy: {} <==> {}", *clientAddress, target);
 
-    if (!clientAddress) {
-        LOG_ERROR("get remote address failed[%s]", clientAddress.error().message().c_str());
-        co_return;
-    }
-
-    LOG_INFO(
-            "TCP proxy[%s <==> %s]",
-            stringify(*clientAddress).c_str(),
-            stringify(target).c_str()
-    );
-
-    auto type = {std::byte{0}};
-    auto result = co_await remote->write(type);
-
-    if (!result) {
-        LOG_ERROR("write proxy type failed[%s]", result.error().message().c_str());
-        co_return;
-    }
-
-    result = co_await writeTarget(remote, target);
-
-    if (!result) {
-        LOG_ERROR("write target failed[%s]", result.error().message().c_str());
-        co_return;
-    }
+    constexpr std::array type = {std::byte{0}};
+    CO_TRY(co_await remote.writeAll(type));
+    CO_TRY(co_await writeTarget(remote, target));
 
     std::byte status[1];
-    result = co_await remote->readExactly(status);
-
-    if (!result) {
-        LOG_ERROR("read status code failed[%s]", result.error().message().c_str());
-        co_return;
-    }
+    CO_TRY(co_await remote.readExactly(status));
 
     if (std::to_integer<int>(status[0]) != 0) {
-        auto response = {
-                std::byte{5},
-                std::byte{5},
-                std::byte{0},
-                std::byte{1},
-                std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
-                std::byte{0}, std::byte{0}
-        };
-
-        result = co_await local->write(response);
-
-        if (!result) {
-            LOG_ERROR("write response failed[%s]", result.error().message().c_str());
-            co_return;
-        }
-
-        co_return;
-    }
-
-    LOG_INFO(
-            "TCP tunnel[%s <==> %s]",
-            stringify(*clientAddress).c_str(),
-            stringify(target).c_str()
-    );
-
-    auto response = {
+        constexpr std::array response = {
             std::byte{5},
-            std::byte{0},
+            std::byte{5},
             std::byte{0},
             std::byte{1},
             std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
             std::byte{0}, std::byte{0}
-    };
+        };
 
-    result = co_await local->write(response);
-
-    if (!result) {
-        LOG_ERROR("write response failed[%s]", result.error().message().c_str());
-        co_return;
+        CO_TRY(co_await local.writeAll(response));
+        co_return tl::expected<void, std::error_code>{};
     }
 
-    co_await zero::async::coroutine::race(asyncio::copy(local, remote), asyncio::copy(remote, local));
+    LOG_INFO("TCP tunnel: {} <==> {}", *clientAddress, target);
+
+    constexpr std::array response = {
+        std::byte{5},
+        std::byte{0},
+        std::byte{0},
+        std::byte{1},
+        std::byte{0}, std::byte{0}, std::byte{0}, std::byte{0},
+        std::byte{0}, std::byte{0}
+    };
+
+    CO_TRY(co_await local.writeAll(response));
+    co_return co_await race(copy(local, remote), copy(remote, local));
 }
 
 template<typename F>
-zero::async::coroutine::Task<void>
-handle(std::shared_ptr<asyncio::net::stream::IBuffer> buffer, std::optional<User> user, F connect) {
-    auto result = co_await handshake(buffer, user);
+zero::async::coroutine::Task<void, std::error_code>
+handle(asyncio::net::stream::Buffer buffer, const std::optional<User> user, F connect) {
+    CO_TRY(co_await handshake(buffer, user));
+    const auto request = CO_TRY(co_await readRequest(buffer));
 
-    if (!result) {
-        LOG_ERROR("handshake failed[%s]", result.error().message().c_str());
-        co_return;
-    }
+    auto remote = CO_TRY(std::move(co_await connect()));
 
-    auto request = co_await readRequest(buffer);
-
-    if (!request) {
-        LOG_ERROR("read request failed[%s]", request.error().message().c_str());
-        co_return;
-    }
-
-    auto remote = std::move(co_await connect()).transform([](asyncio::net::ssl::stream::Buffer &&buffer) {
-        return std::make_shared<asyncio::net::ssl::stream::Buffer>(std::move(buffer));
-    });
-
-    if (!remote) {
-        LOG_ERROR("connect to remote failed[%s]", remote.error().message().c_str());
-        co_return;
-    }
-
-    auto &[command, target] = *request;
-
-    switch (command) {
-        case 1: {
-            co_await proxyTCP(std::move(buffer), std::move(*remote), target);
-            break;
-        }
+    switch (const auto &[command, target] = *request; command) {
+        case 1:
+            co_return co_await proxyTCP(std::move(buffer), std::move(*remote), target);
 
         case 3: {
             std::optional<asyncio::net::Address> source;
@@ -749,37 +463,37 @@ handle(std::shared_ptr<asyncio::net::stream::IBuffer> buffer, std::optional<User
                     break;
             }
 
-            if (!source) {
-                LOG_ERROR("unsupported source address");
-                break;
-            }
+            if (!source)
+                co_return tl::unexpected(UNSUPPORTED_ADDRESS_TYPE);
 
-            co_await proxyUDP(std::move(buffer), std::move(*remote), std::move(*source));
-            break;
+            co_return co_await proxyUDP(std::move(buffer), std::move(*remote), std::move(*source));
         }
 
         default:
-            break;
+            co_return tl::unexpected(UNSUPPORTED_COMMAND);
     }
 }
 
 template<typename F>
 zero::async::coroutine::Task<void, std::error_code>
 serve(asyncio::net::stream::Listener listener, std::optional<User> user, F connect) {
-    tl::expected<void, std::error_code> result;
-
     while (true) {
-        auto buffer = std::move(co_await listener.accept());
+        auto buffer = CO_TRY(std::move(co_await listener.accept()));
 
-        if (!buffer) {
-            result = tl::unexpected(buffer.error());
-            break;
-        }
+        const auto local = CO_TRY(buffer->localAddress());
+        const auto remote = CO_TRY(buffer->remoteAddress());
 
-        handle(std::make_shared<asyncio::net::stream::Buffer>(std::move(*buffer)), user, connect);
+        LOG_INFO("new connection: {} <==> {}", *local, *remote);
+
+        handle(std::move(*buffer), user, connect).promise().then(
+            [=] {
+                LOG_INFO("{} <==> {} disconnect", *local, *remote);
+            },
+            [=](const std::error_code&ec) {
+                LOG_INFO("{} <==> {} disconnect[{}]", *local, *remote, ec.message());
+            }
+        );
     }
-
-    co_return result;
 }
 
 int main(int argc, char *argv[]) {
@@ -813,53 +527,53 @@ int main(int argc, char *argv[]) {
     signal(SIGPIPE, SIG_IGN);
 #endif
 
-    auto server = cmdline.get<std::string>("server");
-    auto port = cmdline.get<unsigned short>("port");
-    auto ca = cmdline.get<std::filesystem::path>("ca");
-    auto cert = cmdline.get<std::filesystem::path>("cert");
-    auto privateKey = cmdline.get<std::filesystem::path>("key");
+    const auto server = cmdline.get<std::string>("server");
+    const auto port = cmdline.get<unsigned short>("port");
+    const auto ca = cmdline.get<std::filesystem::path>("ca");
+    const auto cert = cmdline.get<std::filesystem::path>("cert");
+    const auto privateKey = cmdline.get<std::filesystem::path>("key");
 
-    auto bindIP = cmdline.getOptional<std::string>("bind-ip");
-    auto bindPort = cmdline.getOptional<unsigned short>("bind-port");
-    auto user = cmdline.getOptional<User>("user");
+    const auto bindIP = cmdline.getOptional<std::string>("bind-ip");
+    const auto bindPort = cmdline.getOptional<unsigned short>("bind-port");
+    const auto user = cmdline.getOptional<User>("user");
 
     asyncio::run([&]() -> zero::async::coroutine::Task<void> {
-        auto context = asyncio::net::ssl::newContext(
-                {
-                        .ca = ca,
-                        .cert = cert,
-                        .privateKey = privateKey,
-                }
+        const auto context = asyncio::net::ssl::newContext(
+            {
+                .ca = ca,
+                .cert = cert,
+                .privateKey = privateKey,
+            }
         );
 
         if (!context) {
-            LOG_ERROR("create ssl context failed[%s]", context.error().message().c_str());
+            LOG_ERROR("create ssl context failed[{}]", context.error().message());
             co_return;
         }
 
         auto listener = asyncio::net::stream::listen(*bindIP, *bindPort);
 
         if (!listener) {
-            LOG_ERROR("listen failed[%s]", listener.error().message().c_str());
+            LOG_ERROR("listen failed[{}]", listener.error().message());
             co_return;
         }
 
         auto signal = asyncio::ev::makeSignal(SIGINT);
 
         if (!signal) {
-            LOG_ERROR("make signal failed[%s]", signal.error().message().c_str());
+            LOG_ERROR("make signal failed[{}]", signal.error().message());
             co_return;
         }
 
-        co_await zero::async::coroutine::race(
-                signal->on(),
-                serve(
-                        std::move(*listener),
-                        user,
-                        [=]() {
-                            return asyncio::net::ssl::stream::connect(*context, server, port);
-                        }
-                )
+        co_await race(
+            signal->on(),
+            serve(
+                    std::move(*listener),
+                    user,
+                    [=] {
+                        return asyncio::net::ssl::stream::connect(*context, server, port);
+                    }
+            )
         );
     });
 
