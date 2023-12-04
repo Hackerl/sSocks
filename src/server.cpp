@@ -119,7 +119,10 @@ zero::async::coroutine::Task<void, std::error_code> proxyUDP(asyncio::net::ssl::
     const auto localBuffer = std::make_shared<asyncio::net::ssl::stream::Buffer>(std::move(local));
     const auto remoteSocket = std::make_shared<asyncio::net::dgram::Socket>(std::move(*remote));
 
-    co_return co_await race(UDPToRemote(localBuffer, remoteSocket), UDPToClient(remoteSocket, localBuffer));
+    CO_TRY(co_await race(UDPToRemote(localBuffer, remoteSocket), UDPToClient(remoteSocket, localBuffer)));
+
+    co_await localBuffer->flush();
+    co_return tl::expected<void, std::error_code>{};
 }
 
 zero::async::coroutine::Task<void, std::error_code> proxyTCP(asyncio::net::ssl::stream::Buffer local) {
@@ -148,7 +151,12 @@ zero::async::coroutine::Task<void, std::error_code> proxyTCP(asyncio::net::ssl::
     constexpr std::array status = {std::byte{0}};
     CO_TRY(co_await local.writeAll(status));
 
-    co_return co_await race(copy(local, *remote), copy(*remote, local));
+    CO_TRY(co_await race(copy(local, *remote), copy(*remote, local)));
+
+    co_await local.flush();
+    co_await remote->flush();
+
+    co_return tl::expected<void, std::error_code>{};
 }
 
 zero::async::coroutine::Task<void, std::error_code> handle(asyncio::net::ssl::stream::Buffer buffer) {

@@ -382,7 +382,7 @@ proxyUDP(
     const auto localSocket = std::make_shared<asyncio::net::dgram::Socket>(std::move(*local));
     const auto remoteBuffer = std::make_shared<asyncio::net::ssl::stream::Buffer>(std::move(remote));
 
-    co_return co_await race(
+    CO_TRY(co_await race(
         [](auto buf) -> zero::async::coroutine::Task<void, std::error_code> {
             while (true) {
                 std::byte data[10240];
@@ -391,7 +391,10 @@ proxyUDP(
         }(std::move(buffer)),
         UDPToRemote(localSocket, remoteBuffer, *client),
         UDPToClient(remoteBuffer, localSocket, *client)
-    );
+    ));
+
+    co_await remoteBuffer->flush();
+    co_return tl::expected<void, std::error_code>{};
 }
 
 zero::async::coroutine::Task<void, std::error_code>
@@ -432,7 +435,12 @@ proxyTCP(asyncio::net::stream::Buffer local, asyncio::net::ssl::stream::Buffer r
     };
 
     CO_TRY(co_await local.writeAll(response));
-    co_return co_await race(copy(local, remote), copy(remote, local));
+    CO_TRY(co_await race(copy(local, remote), copy(remote, local)));
+
+    co_await local.flush();
+    co_await remote.flush();
+
+    co_return tl::expected<void, std::error_code>{};
 }
 
 template<typename F>
