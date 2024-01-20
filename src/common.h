@@ -38,7 +38,6 @@ writeTarget(asyncio::IBufWriter &writer, Target target);
 
 template<>
 struct std::is_error_code_enum<Error> : std::true_type {
-
 };
 
 template<typename Char>
