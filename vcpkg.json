@@ -1,27 +1,8 @@
 {
   "name": "secure-socks",
   "version-string": "1.0.0",
-  "builtin-baseline": "c9e2aa851e987698519f58518aa16564af3a85ab",
+  "builtin-baseline": "9224b3bbd8df24999d85720b1d005dd6f969ade0",
   "dependencies": [
-    {
-      "name": "asyncio",
-      "features": [
-        "embedded"
-      ]
-    }
-  ],
-  "features": {
-    "legacy": {
-      "description": "Compatible with older Windows",
-      "supports": "windows",
-      "dependencies": [
-        {
-          "name": "asyncio",
-          "features": [
-            "legacy"
-          ]
-        }
-      ]
-    }
-  }
+    "asyncio"
+  ]
 }
