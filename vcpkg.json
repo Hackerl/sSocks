@@ -1,7 +1,7 @@
 {
   "name": "secure-socks",
   "version-string": "1.0.0",
-  "builtin-baseline": "9224b3bbd8df24999d85720b1d005dd6f969ade0",
+  "builtin-baseline": "6b3172d1a7be062b3d0278369aac9a0258cefc65",
   "dependencies": [
     "asyncio"
   ]

@@ -10,7 +10,7 @@
 asyncio::task::Task<void, std::error_code>
 UDPToRemote(const std::uint64_t id, asyncio::IReader &local, asyncio::net::UDPSocket &remote) {
     while (true) {
-        const auto target = co_await readTarget(local);
+        auto target = co_await readTarget(local);
         CO_EXPECT(target);
 
         const auto length = co_await asyncio::binary::readBE<std::uint32_t>(local);
@@ -22,15 +22,15 @@ UDPToRemote(const std::uint64_t id, asyncio::IReader &local, asyncio::net::UDPSo
         CO_EXPECT(co_await local.readExactly(payload));
 
         CO_EXPECT(co_await std::visit(
-            [&]<typename T>(const T &arg) {
+            [&]<typename T>(T arg) {
                 if constexpr (std::is_same_v<T, HostAddress>) {
-                    return remote.writeTo(payload, arg.hostname, arg.port);
+                    return remote.writeTo(payload, std::move(arg.hostname), arg.port);
                 }
                 else {
-                    return remote.writeTo(payload, arg);
+                    return remote.writeTo(payload, std::move(arg));
                 }
             },
-            *target
+            *std::move(target)
         ));
     }
 }
@@ -79,14 +79,13 @@ proxyTCP(const std::uint64_t id, asyncio::net::tls::TLS<asyncio::net::TCPStream>
 
     if (!remote) {
         CO_EXPECT(co_await asyncio::binary::writeBE(local, std::to_underlying(ProxyStatus::FAIL)));
-        co_return std::unexpected(remote.error());
+        co_return std::unexpected{remote.error()};
     }
 
     CO_EXPECT(co_await asyncio::binary::writeBE(local, std::to_underlying(ProxyStatus::SUCCESS)));
+    CO_EXPECT(co_await asyncio::net::copyBidirectional(local, *remote));
 
-    co_return co_await copyBidirectional(local, *remote).andThen([&] {
-        return local.close();
-    });
+    co_return {};
 }
 
 asyncio::task::Task<void, std::error_code>
@@ -97,7 +96,7 @@ handle(const std::uint64_t id, asyncio::net::tls::TLS<asyncio::net::TCPStream> t
     if (static_cast<ProxyType>(*type) == ProxyType::TCP)
         co_return co_await proxyTCP(id, std::move(tls));
 
-    auto remote = asyncio::net::UDPSocket::make();
+    auto remote = asyncio::net::UDPSocket::bind("0.0.0.0", 0);
     CO_EXPECT(remote);
 
     co_return co_await race(
@@ -110,9 +109,16 @@ handle(const std::uint64_t id, asyncio::net::tls::TLS<asyncio::net::TCPStream> t
 
 asyncio::task::Task<void, std::error_code>
 serve(asyncio::net::TCPListener listener, const asyncio::net::tls::Context context) {
+    std::expected<void, std::error_code> result;
+    asyncio::task::TaskGroup group;
+
     while (true) {
         auto stream = co_await listener.accept();
-        CO_EXPECT(stream);
+
+        if (!stream) {
+            result = std::unexpected{stream.error()};
+            break;
+        }
 
         const auto localAddress = stream->localAddress();
         const auto remoteAddress = stream->remoteAddress();
@@ -125,23 +131,28 @@ serve(asyncio::net::TCPListener listener, const asyncio::net::tls::Context conte
 
         LOG_INFO("[{}] session: fd={} address={} client={}", id, stream->fd(), *localAddress, *remoteAddress);
 
-        asyncio::net::tls::accept(*std::move(stream), context)
+        auto task = asyncio::net::tls::accept(*std::move(stream), context)
             .andThen([=](asyncio::net::tls::TLS<asyncio::net::TCPStream> tls) {
                 return handle(id, std::move(tls));
-            })
-            .future().fail([=](const std::error_code &ec) {
-                LOG_ERROR("[{}] unhandled error: {} ({})", id, ec.message(), ec);
             });
+        group.add(task);
+
+        task.future().fail([=](const auto &ec) {
+            LOG_ERROR("[{}] unhandled error: {:s} ({})", id, ec, ec);
+        });
     }
+
+    co_await group;
+    co_return result;
 }
 
 asyncio::task::Task<void, std::error_code> asyncMain(const int argc, char *argv[]) {
-    INIT_CONSOLE_LOG(zero::LogLevel::INFO_LEVEL);
+    INIT_CONSOLE_LOG(zero::log::Level::INFO_LEVEL);
 
     zero::Cmdline cmdline;
 
     cmdline.add<std::string>("ip", "listen ip");
-    cmdline.add<unsigned short>("port", "listen port");
+    cmdline.add<std::uint16_t>("port", "listen port");
 
     cmdline.add<std::filesystem::path>("ca", "CA cert path");
     cmdline.add<std::filesystem::path>("cert", "cert path");
@@ -150,26 +161,24 @@ asyncio::task::Task<void, std::error_code> asyncMain(const int argc, char *argv[
     cmdline.parse(argc, argv);
 
     const auto ip = cmdline.get<std::string>("ip");
-    const auto port = cmdline.get<unsigned short>("port");
+    const auto port = cmdline.get<std::uint16_t>("port");
     const auto caFile = cmdline.get<std::filesystem::path>("ca");
     const auto certFile = cmdline.get<std::filesystem::path>("cert");
     const auto keyFile = cmdline.get<std::filesystem::path>("key");
 
-    auto ca = asyncio::net::tls::Certificate::loadFile(caFile);
+    auto ca = co_await asyncio::net::tls::Certificate::loadFile(caFile);
     CO_EXPECT(ca);
 
-    auto cert = asyncio::net::tls::Certificate::loadFile(certFile);
+    auto cert = co_await asyncio::net::tls::Certificate::loadFile(certFile);
     CO_EXPECT(cert);
 
-    auto key = asyncio::net::tls::PrivateKey::loadFile(keyFile);
+    auto key = co_await asyncio::net::tls::PrivateKey::loadFile(keyFile);
     CO_EXPECT(key);
 
-    const asyncio::net::tls::ServerConfig config = {
-        .rootCAs = {*std::move(ca)},
-        .certKeyPairs = {{*std::move(cert), *std::move(key)}}
-    };
-
-    auto context = config.build();
+    auto context = asyncio::net::tls::ServerConfig{}
+                   .rootCAs({*std::move(ca)})
+                   .certKeyPairs({{*std::move(cert), *std::move(key)}})
+                   .build();
     CO_EXPECT(context);
 
     auto listener = asyncio::net::TCPListener::listen(ip, port);
@@ -179,8 +188,8 @@ asyncio::task::Task<void, std::error_code> asyncMain(const int argc, char *argv[
     CO_EXPECT(signal);
 
     co_return co_await race(
+        serve(*std::move(listener), *std::move(context)),
         signal->on(SIGINT).transform([](const int) {
-        }),
-        serve(*std::move(listener), *std::move(context))
+        })
     );
 }
