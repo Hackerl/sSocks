@@ -1,100 +1,136 @@
 name: sSocks
 on: [ push ]
 jobs:
-  linux-amd64:
+  linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v5
       - name: Install LLVM
         run: |
           wget https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
-          sudo ./llvm.sh 17
-          sudo apt install -y libc++abi-17-dev libc++-17-dev
-      - name: Build
-        run: |
-          mkdir -p build
-          cmake -B build -DCMAKE_TOOLCHAIN_FILE="${VCPKG_INSTALLATION_ROOT}/scripts/buildsystems/vcpkg.cmake"
-          cmake --build build -j$(nproc)
+          sudo ./llvm.sh 19
+          sudo apt install -y libc++abi-19-dev libc++-19-dev
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
         env:
-          CC: clang-17
-          CXX: clang++-17
+          VCPKG_BINARY_SOURCES: default,rw
+      - name: Setup vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: ${{ runner.os }}-vcpkg-binary-cache-${{ hashFiles('vcpkg*.json') }}
+          restore-keys: |
+            ${{ runner.os }}-vcpkg-binary-cache-
+      - name: Build
+        uses: lukka/run-cmake@v10
+        with:
+          workflowPreset: debug
+        env:
+          CC: clang-19
+          CXX: clang++-19
           CXXFLAGS: -stdlib=libc++
 
-  linux-static-amd64:
+  linux-static:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v5
       - name: Install musl toolchains
-        run: curl -fsSL https://github.com/Hackerl/musl-cross-make/releases/download/gcc-13.2.0/x86_64-linux-musl-native-gcc13.tar.gz | tar -xz -C /opt
-      - name: Build
-        run: |
-          mkdir -p build
-          cmake -B build \
-            -DCMAKE_TOOLCHAIN_FILE="${VCPKG_INSTALLATION_ROOT}/scripts/buildsystems/vcpkg.cmake" \
-            -DCMAKE_EXE_LINKER_FLAGS="-static-pie"
-          cmake --build build -j$(nproc)
+        run: curl -fsSL https://github.com/Hackerl/musl-cross-make/releases/download/gcc-15.2.0/x86_64-linux-musl-native-gcc15.2.0.tar.gz | tar -xz -C /opt
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
         env:
-          CC: /opt/x86_64-linux-musl-native/bin/x86_64-linux-musl-gcc
-          CXX: /opt/x86_64-linux-musl-native/bin/x86_64-linux-musl-g++
+          VCPKG_BINARY_SOURCES: default,rw
+      - name: Setup vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: ${{ runner.os }}-vcpkg-binary-cache-${{ hashFiles('vcpkg*.json') }}
+          restore-keys: |
+            ${{ runner.os }}-vcpkg-binary-cache-
+      - name: Build
+        uses: lukka/run-cmake@v10
+        with:
+          configurePreset: debug
+          configurePresetAdditionalArgs: "['-DCMAKE_EXE_LINKER_FLAGS=-static-pie']"
+          buildPreset: debug
+        env:
+          CC: /opt/x86_64-linux-musl-native-gcc15.2.0/bin/x86_64-linux-musl-gcc
+          CXX: /opt/x86_64-linux-musl-native-gcc15.2.0/bin/x86_64-linux-musl-g++
 
-  windows-amd64:
+  windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: ilammy/msvc-dev-cmd@v1
-      - uses: seanmiddleditch/gha-setup-ninja@master
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        env:
+          VCPKG_BINARY_SOURCES: default,rw
+      - name: Setup vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: ${{ runner.os }}-vcpkg-binary-cache-${{ hashFiles('vcpkg*.json') }}
+          restore-keys: |
+            ${{ runner.os }}-vcpkg-binary-cache-
       - name: Build
-        run: |
-          mkdir -p build
-          cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
-          cmake --build build -j $env:NUMBER_OF_PROCESSORS
+        uses: lukka/run-cmake@v10
+        with:
+          workflowPreset: debug
 
-  windows-legacy-amd64:
+  windows-32:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: ilammy/msvc-dev-cmd@v1
-      - uses: seanmiddleditch/gha-setup-ninja@master
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        env:
+          VCPKG_BINARY_SOURCES: default,rw
+      - name: Setup vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: ${{ runner.os }}-vcpkg-binary-cache-${{ hashFiles('vcpkg*.json') }}
+          restore-keys: |
+            ${{ runner.os }}-vcpkg-binary-cache-
       - name: Build
-        run: |
-          mkdir -p build
-          cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_MANIFEST_FEATURES="legacy"
-          cmake --build build -j $env:NUMBER_OF_PROCESSORS
+        uses: lukka/run-cmake@v10
+        with:
+          configurePreset: debug
+          configurePresetAdditionalArgs: "['-A Win32']"
+        env:
+          VCPKG_DEFAULT_TRIPLET: x86-windows
 
-  macos-amd64:
+  macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v5
       - name: Install LLVM
         run: |
-          brew install llvm
-          echo "LLVM_HOME=$(brew --prefix llvm)" >> $GITHUB_ENV
+          brew install llvm@19
+          echo "LLVM_HOME=$(brew --prefix llvm@19)" >> $GITHUB_ENV
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11
+        env:
+          VCPKG_BINARY_SOURCES: default,rw
+      - name: Setup vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: ${{ runner.os }}-vcpkg-binary-cache-${{ hashFiles('vcpkg*.json') }}
+          restore-keys: |
+            ${{ runner.os }}-vcpkg-binary-cache-
       - name: Build
-        run: |
-          mkdir -p build
-          cmake -B build -DCMAKE_TOOLCHAIN_FILE="${VCPKG_INSTALLATION_ROOT}/scripts/buildsystems/vcpkg.cmake"
-          cmake --build build -j$(sysctl -n hw.physicalcpu)
+        uses: lukka/run-cmake@v10
+        with:
+          workflowPreset: debug
         env:
           CC: ${{ env.LLVM_HOME }}/bin/clang
           CXX: ${{ env.LLVM_HOME }}/bin/clang++
-          LDFLAGS: -L${{ env.LLVM_HOME }}/lib -L${{ env.LLVM_HOME }}/lib/c++ -Wl,-rpath,${{ env.LLVM_HOME }}/lib/c++
-
-  android-arm64:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - name: Use latest NDK
-        run: echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> $GITHUB_ENV
-      - name: Patch vcpkg
-        run: sed -i 's/-avoid-version $ENV/$ENV/g' "${VCPKG_INSTALLATION_ROOT}/scripts/cmake/vcpkg_configure_make.cmake"
-      - name: Build
-        run: |
-          mkdir -p build
-          cmake -B build \
-            -DCMAKE_TOOLCHAIN_FILE="${VCPKG_INSTALLATION_ROOT}/scripts/buildsystems/vcpkg.cmake" \
-            -DVCPKG_CHAINLOAD_TOOLCHAIN_FILE=${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake \
-            -DVCPKG_TARGET_TRIPLET=arm64-android \
-            -DANDROID_ABI=arm64-v8a \
-            -DANDROID_PLATFORM=android-24
-          cmake --build build -j$(nproc)
+          LDFLAGS: -L${{ env.LLVM_HOME }}/lib/c++ -L${{ env.LLVM_HOME }}/lib -L${{ env.LLVM_HOME }}/lib/unwind -lunwind -Wl,-rpath,${{ env.LLVM_HOME }}/lib/c++ -Wl,-rpath,${{ env.LLVM_HOME }}/lib -Wl,-rpath,${{ env.LLVM_HOME }}/lib/unwind
+          SDKROOT: macosx
