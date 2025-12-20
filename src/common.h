@@ -27,78 +27,74 @@ struct HostAddress {
 
 using Target = std::variant<HostAddress, asyncio::net::IPv4Address, asyncio::net::IPv6Address>;
 
-DEFINE_ERROR_CODE(
+Z_DEFINE_ERROR_CODE(
     ReadTargetError,
     "readTarget",
-    UNSUPPORTED_ADDRESS_TYPE, "unsupported address type"
+    UNSUPPORTED_ADDRESS_TYPE, "Unsupported address type"
 )
 
-DECLARE_ERROR_CODE(ReadTargetError)
-DEFINE_ERROR_CATEGORY_INSTANCES(ReadTargetError)
+Z_DECLARE_ERROR_CODE(ReadTargetError)
+Z_DEFINE_ERROR_CATEGORY_INSTANCES(ReadTargetError)
 
-inline asyncio::task::Task<Target, std::error_code> readTarget(asyncio::IReader &reader) {
-    const auto type = co_await asyncio::binary::readBE<std::int32_t>(reader);
-    CO_EXPECT(type);
+inline asyncio::task::Task<Target> readTarget(asyncio::IReader &reader) {
+    const auto type = zero::error::guard(co_await asyncio::binary::readBE<std::int32_t>(reader));
+    const auto port = zero::error::guard(co_await asyncio::binary::readBE<std::uint16_t>(reader));
 
-    const auto port = co_await asyncio::binary::readBE<std::uint16_t>(reader);
-    CO_EXPECT(port);
-
-    switch (static_cast<AddressType>(*type)) {
+    switch (static_cast<AddressType>(type)) {
     case AddressType::HOSTNAME: {
-        const auto length = co_await asyncio::binary::readBE<std::size_t>(reader);
-        CO_EXPECT(length);
+        const auto length = zero::error::guard(co_await asyncio::binary::readBE<std::size_t>(reader));
 
         std::string hostname;
-        hostname.resize(*length);
+        hostname.resize(length);
 
-        CO_EXPECT(co_await reader.readExactly(std::as_writable_bytes(std::span{hostname})));
-        co_return HostAddress{*port, std::move(hostname)};
+        zero::error::guard(co_await reader.readExactly(std::as_writable_bytes(std::span{hostname})));
+        co_return HostAddress{port, std::move(hostname)};
     }
 
     case AddressType::IPV4: {
         std::array<std::byte, 4> ip{};
-        CO_EXPECT(co_await reader.readExactly(ip));
-        co_return asyncio::net::IPv4Address{ip, *port};
+        zero::error::guard(co_await reader.readExactly(ip));
+        co_return asyncio::net::IPv4Address{ip, port};
     }
 
     case AddressType::IPV6: {
         std::array<std::byte, 16> ip{};
-        CO_EXPECT(co_await reader.readExactly(ip));
-        co_return asyncio::net::IPv6Address{ip, *port};
+        zero::error::guard(co_await reader.readExactly(ip));
+        co_return asyncio::net::IPv6Address{ip, port};
     }
 
     default:
-        co_return std::unexpected{ReadTargetError::UNSUPPORTED_ADDRESS_TYPE};
+        throw zero::error::SystemError{ReadTargetError::UNSUPPORTED_ADDRESS_TYPE};
     }
 }
 
-inline asyncio::task::Task<void, std::error_code> writeTarget(asyncio::IWriter &writer, Target target) {
-    co_return co_await std::visit(
-        [&]<typename T>(T arg) -> asyncio::task::Task<void, std::error_code> {
+inline asyncio::task::Task<void> writeTarget(asyncio::IWriter &writer, Target target) {
+    co_await std::visit(
+        [&]<typename T>(T arg) -> asyncio::task::Task<void> {
             if constexpr (std::is_same_v<T, HostAddress>) {
                 const auto &[port, hostname] = arg;
 
-                CO_EXPECT(co_await asyncio::binary::writeBE(writer, std::to_underlying(AddressType::HOSTNAME)));
-                CO_EXPECT(co_await asyncio::binary::writeBE(writer, port));
-                CO_EXPECT(co_await asyncio::binary::writeBE(writer, hostname.length()));
-                CO_EXPECT(co_await writer.writeAll(std::as_bytes(std::span{hostname})));
+                zero::error::guard(
+                    co_await asyncio::binary::writeBE(writer, std::to_underlying(AddressType::HOSTNAME))
+                );
+                zero::error::guard(co_await asyncio::binary::writeBE(writer, port));
+                zero::error::guard(co_await asyncio::binary::writeBE(writer, hostname.length()));
+                zero::error::guard(co_await writer.writeAll(std::as_bytes(std::span{hostname})));
             }
             else if constexpr (std::is_same_v<T, asyncio::net::IPv4Address>) {
                 const auto [ip, port] = arg;
 
-                CO_EXPECT(co_await asyncio::binary::writeBE(writer, std::to_underlying(AddressType::IPV4)));
-                CO_EXPECT(co_await asyncio::binary::writeBE(writer, port));
-                CO_EXPECT(co_await writer.writeAll(ip));
+                zero::error::guard(co_await asyncio::binary::writeBE(writer, std::to_underlying(AddressType::IPV4)));
+                zero::error::guard(co_await asyncio::binary::writeBE(writer, port));
+                zero::error::guard(co_await writer.writeAll(ip));
             }
             else {
                 const auto &[ip, port, zone] = arg;
 
-                CO_EXPECT(co_await asyncio::binary::writeBE(writer, std::to_underlying(AddressType::IPV6)));
-                CO_EXPECT(co_await asyncio::binary::writeBE(writer, port));
-                CO_EXPECT(co_await writer.writeAll(ip));
+                zero::error::guard(co_await asyncio::binary::writeBE(writer, std::to_underlying(AddressType::IPV6)));
+                zero::error::guard(co_await asyncio::binary::writeBE(writer, port));
+                zero::error::guard(co_await writer.writeAll(ip));
             }
-
-            co_return {};
         },
         std::move(target)
     );
