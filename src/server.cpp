@@ -95,7 +95,7 @@ handle(const std::uint64_t id, asyncio::net::TCPStream stream, asyncio::net::tls
         co_return;
     }
     else if (static_cast<ProxyType>(type) == ProxyType::UDP) {
-        auto remote = co_await asyncio::error::guard(asyncio::net::UDPSocket::bind("::", 0));
+        auto remote = co_await asyncio::error::guard(asyncio::net::UDPSocket::bind("0.0.0.0", 0));
 
         co_await race(
             UDPToRemote(id, tls, remote),
