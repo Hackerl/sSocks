@@ -87,7 +87,7 @@ A tiny socks5 VPN based on TLS mutual authentication.
 
 * [![CMake][CMake]][CMake-url]
 * [![vcpkg][vcpkg]][vcpkg-url]
-* [![C++17][C++17]][C++17-url]
+* [![C++23][C++23]][C++23-url]
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -234,7 +234,7 @@ Project Link: [https://github.com/Hackerl/sSocks](https://github.com/Hackerl/sSo
 <!-- ACKNOWLEDGMENTS -->
 ## Acknowledgments
 
-* [aio](https://github.com/hackerl/aio)
+* [asyncio](https://github.com/Hackerl/asyncio)
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -256,5 +256,5 @@ Project Link: [https://github.com/Hackerl/sSocks](https://github.com/Hackerl/sSo
 [CMake-url]: https://cmake.org
 [vcpkg]: https://img.shields.io/badge/vcpkg-000000?style=for-the-badge&logo=microsoft&logoColor=61DAFB
 [vcpkg-url]: https://vcpkg.io
-[C++17]: https://img.shields.io/badge/C++17-000000?style=for-the-badge&logo=cplusplus&logoColor=4FC08D
-[C++17-url]: https://en.cppreference.com/w/cpp/17
+[C++23]: https://img.shields.io/badge/C++23-000000?style=for-the-badge&logo=cplusplus&logoColor=4FC08D
+[C++23-url]: https://en.cppreference.com/w/cpp/23
