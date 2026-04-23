@@ -12,24 +12,24 @@ asyncio::task::Task<void>
 UDPToRemote(const std::uint64_t id, asyncio::IReader &local, asyncio::net::UDPSocket &remote) {
     while (true) {
         auto target = co_await readTarget(local);
-        const auto length = zero::error::guard(co_await asyncio::binary::readBE<std::uint32_t>(local));
+        const auto length = co_await asyncio::error::guard(asyncio::binary::readBE<std::uint32_t>(local));
 
-        Z_LOG_DEBUG("[{}] Send {} bytes to {}", id, length, target);
+        Z_LOG_DEBUG("[{}] UDP client->remote: {} bytes to {}", id, length, target);
 
         std::vector<std::byte> payload(length);
-        zero::error::guard(co_await local.readExactly(payload));
+        co_await asyncio::error::guard(local.readExactly(payload));
 
-        zero::error::guard(co_await std::visit(
-            [&]<typename T>(T arg) {
-                if constexpr (std::is_same_v<T, HostAddress>) {
-                    return remote.writeTo(payload, std::move(arg.hostname), arg.port);
-                }
-                else {
-                    return remote.writeTo(payload, std::move(arg));
-                }
-            },
-            std::move(target)
-        ));
+        co_await asyncio::error::guard(
+            std::visit(
+                [&]<typename T>(T arg) {
+                    if constexpr (std::is_same_v<T, HostAddress>)
+                        return remote.writeTo(payload, std::move(arg.hostname), arg.port);
+                    else
+                        return remote.writeTo(payload, std::move(arg));
+                },
+                std::move(target)
+            )
+        );
     }
 }
 
@@ -38,23 +38,23 @@ UDPToClient(const std::uint64_t id, asyncio::net::UDPSocket &remote, asyncio::IW
     while (true) {
         std::array<std::byte, 65535> data; // NOLINT(*-pro-type-member-init)
 
-        const auto &[n, from] = zero::error::guard(co_await remote.readFrom(data));
-        Z_LOG_DEBUG("[{}] Receive {} bytes from {}", id, n, from);
+        const auto &[n, from] = co_await asyncio::error::guard(remote.readFrom(data));
+        Z_LOG_DEBUG("[{}] UDP remote->client: {} bytes from {}", id, n, from);
 
         if (std::holds_alternative<asyncio::net::IPv4Address>(from))
             co_await writeTarget(local, std::get<asyncio::net::IPv4Address>(from));
         else
             co_await writeTarget(local, std::get<asyncio::net::IPv6Address>(from));
 
-        zero::error::guard(co_await asyncio::binary::writeBE(local, static_cast<std::uint32_t>(n)));
-        zero::error::guard(co_await local.writeAll({data.data(), n}));
+        co_await asyncio::error::guard(asyncio::binary::writeBE(local, static_cast<std::uint32_t>(n)));
+        co_await asyncio::error::guard(local.writeAll({data.data(), n}));
     }
 }
 
 asyncio::task::Task<void>
 proxyTCP(const std::uint64_t id, asyncio::net::tls::TLS<asyncio::net::TCPStream> local) {
     auto target = co_await readTarget(local);
-    Z_LOG_INFO("[{}] Target: {}", id, target);
+    Z_LOG_INFO("[{}] Connecting to {}", id, target);
 
     auto remote = co_await std::visit(
         []<typename T>(T arg) {
@@ -69,40 +69,44 @@ proxyTCP(const std::uint64_t id, asyncio::net::tls::TLS<asyncio::net::TCPStream>
     );
 
     if (!remote) {
-        zero::error::guard(co_await asyncio::binary::writeBE(local, std::to_underlying(ProxyStatus::FAIL)));
-        throw zero::error::SystemError{remote.error()};
+        co_await asyncio::error::guard(asyncio::binary::writeBE(local, std::to_underlying(ProxyStatus::FAIL)));
+        throw co_await asyncio::error::StacktraceError<std::system_error>::make(remote.error());
     }
 
-    zero::error::guard(co_await asyncio::binary::writeBE(local, std::to_underlying(ProxyStatus::SUCCESS)));
-    zero::error::guard(co_await asyncio::net::copyBidirectional(local, *remote));
+    co_await asyncio::error::guard(asyncio::binary::writeBE(local, std::to_underlying(ProxyStatus::SUCCESS)));
+    co_await asyncio::error::guard(asyncio::net::copyBidirectional(local, *remote));
 }
 
 asyncio::task::Task<void>
 handle(const std::uint64_t id, asyncio::net::TCPStream stream, asyncio::net::tls::Context context) {
     Z_LOG_INFO(
-        "[{}] Session: fd={} address={} client={}",
+        "[{}] New session: fd={} local={} peer={}",
         id,
         stream.fd(),
-        zero::error::guard(stream.localAddress()),
-        zero::error::guard(stream.remoteAddress())
+        co_await asyncio::error::guard(stream.localAddress()),
+        co_await asyncio::error::guard(stream.remoteAddress())
     );
 
-    auto tls = zero::error::guard(co_await asyncio::net::tls::accept(std::move(stream), std::move(context)));
+    auto tls = co_await asyncio::error::guard(asyncio::net::tls::accept(std::move(stream), std::move(context)));
 
-    if (const auto type = zero::error::guard(co_await asyncio::binary::readBE<std::int32_t>(tls));
+    if (const auto type = co_await asyncio::error::guard(asyncio::binary::readBE<std::int32_t>(tls));
         static_cast<ProxyType>(type) == ProxyType::TCP) {
         co_await proxyTCP(id, std::move(tls));
         co_return;
     }
+    else if (static_cast<ProxyType>(type) == ProxyType::UDP) {
+        auto remote = co_await asyncio::error::guard(asyncio::net::UDPSocket::bind("::", 0));
 
-    auto remote = zero::error::guard(asyncio::net::UDPSocket::bind("0.0.0.0", 0));
+        co_await race(
+            UDPToRemote(id, tls, remote),
+            UDPToClient(id, remote, tls)
+        );
 
-    co_await race(
-        UDPToRemote(id, tls, remote),
-        UDPToClient(id, remote, tls)
-    );
-
-    zero::error::guard(co_await tls.close());
+        co_await asyncio::error::guard(tls.close());
+    }
+    else {
+        throw std::runtime_error{fmt::format("Unknown proxy type: {}", type)};
+    }
 }
 
 asyncio::task::Task<void> serve(asyncio::net::TCPListener listener, const asyncio::net::tls::Context context) {
@@ -124,16 +128,16 @@ asyncio::task::Task<void> serve(asyncio::net::TCPListener listener, const asynci
         group.add(task);
 
         task.future().fail([=](const auto &e) {
-            Z_LOG_ERROR("[{}] Unhandled exception: {}", id, e);
+            Z_LOG_ERROR("[{}] Session error: {}", id, e);
         });
     }
 
     co_await group;
-    zero::error::guard(std::move(result));
+    co_await asyncio::error::guard(std::move(result));
 }
 
 asyncio::task::Task<void> asyncMain(const int argc, char *argv[]) {
-    Z_INIT_CONSOLE_LOG(zero::log::Level::INFO_LEVEL);
+    Z_INIT_CONSOLE_LOG(zero::log::Level::Info);
 
     zero::Cmdline cmdline;
 
@@ -152,24 +156,24 @@ asyncio::task::Task<void> asyncMain(const int argc, char *argv[]) {
     const auto certFile = cmdline.get<std::filesystem::path>("cert");
     const auto keyFile = cmdline.get<std::filesystem::path>("key");
 
-    auto ca = zero::error::guard(co_await asyncio::net::tls::Certificate::loadFile(caFile));
-    auto cert = zero::error::guard(co_await asyncio::net::tls::Certificate::loadFile(certFile));
-    auto key = zero::error::guard(co_await asyncio::net::tls::PrivateKey::loadFile(keyFile));
+    auto ca = co_await asyncio::error::guard(asyncio::net::tls::Certificate::loadFile(caFile));
+    auto cert = co_await asyncio::error::guard(asyncio::net::tls::Certificate::loadFile(certFile));
+    auto key = co_await asyncio::error::guard(asyncio::net::tls::PrivateKey::loadFile(keyFile));
 
-    auto context = zero::error::guard(
+    auto context = co_await asyncio::error::guard(
         asyncio::net::tls::ServerConfig{}
         .rootCAs({std::move(ca)})
         .certKeyPairs({{std::move(cert), std::move(key)}})
         .build()
     );
 
-    auto listener = zero::error::guard(asyncio::net::TCPListener::listen(ip, port));
+    auto listener = co_await asyncio::error::guard(asyncio::net::TCPListener::listen(ip, port));
     auto signal = asyncio::Signal::make();
 
     co_await race(
         serve(std::move(listener), std::move(context)),
         asyncio::task::spawn([&]() -> asyncio::task::Task<void> {
-            zero::error::guard(co_await signal.on(SIGINT));
+            co_await asyncio::error::guard(signal.on(SIGINT));
         })
     );
 }
