@@ -97,12 +97,17 @@ handle(const std::uint64_t id, asyncio::net::TCPStream stream, asyncio::net::tls
     else if (static_cast<ProxyType>(type) == ProxyType::UDP) {
         auto remote = co_await asyncio::error::guard(asyncio::net::UDPSocket::bind("0.0.0.0", 0));
 
-        co_await race(
-            UDPToRemote(id, tls, remote),
-            UDPToClient(id, remote, tls)
+        const auto result = co_await asyncio::error::capture(
+            race(
+                UDPToRemote(id, tls, remote),
+                UDPToClient(id, remote, tls)
+            )
         );
 
         co_await asyncio::error::guard(tls.close());
+
+        if (!result)
+            std::rethrow_exception(result.error());
     }
     else {
         throw std::runtime_error{fmt::format("Unknown proxy type: {}", type)};
