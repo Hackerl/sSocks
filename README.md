@@ -100,6 +100,15 @@ Both the server and the client need their own private keys and certificates when
 
 ### Prerequisites
 
+Required compiler:
+* GCC >= 15
+* LLVM >= 18
+* MSVC >= 19.38
+
+Export environment variables:
+* VCPKG_ROOT
+* ANDROID_NDK_HOME(Android)
+
 Create openssl 509 extended configuration, then generate all keys and certificates needed.
 
 * ext.cnf
@@ -132,27 +141,11 @@ Create openssl 509 extended configuration, then generate all keys and certificat
   openssl x509 -req -days 365 -sha256 -extensions v3_req -CA  cacert.pem -CAkey cakey.pem  -CAserial ca.srl -in client.csr -out client-cert.pem
   ```
 
-Export environment variables:
-* VCPKG_INSTALLATION_ROOT
-* ANDROID_NDK_HOME(Android)
-
 ### Build
 
-* Linux
-  ```sh
-  mkdir -p build && cmake -B build -DCMAKE_TOOLCHAIN_FILE="${VCPKG_INSTALLATION_ROOT}/scripts/buildsystems/vcpkg.cmake" && cmake --build build -j$(nproc)
-  ```
-
-* Android
-  ```sh
-  # set "ANDROID_PLATFORM" for dependencies installed by vcpkg: echo 'set(VCPKG_CMAKE_SYSTEM_VERSION 24)' >> "${VCPKG_INSTALLATION_ROOT}/triplets/community/arm64-android.cmake"
-  mkdir -p build && cmake -B build -DCMAKE_TOOLCHAIN_FILE="${VCPKG_INSTALLATION_ROOT}/scripts/buildsystems/vcpkg.cmake" -DVCPKG_CHAINLOAD_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" -DVCPKG_TARGET_TRIPLET=arm64-android -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 && cmake --build build -j$(nproc)
-  ```
-
-* Windows(Developer PowerShell)
-  ```sh
-  mkdir -p build && cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" && cmake --build build -j $env:NUMBER_OF_PROCESSORS
-  ```
+```sh
+cmake --workflow --preset debug
+```
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
