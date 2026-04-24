@@ -254,7 +254,7 @@ Project Link: [https://github.com/Hackerl/sSocks](https://github.com/Hackerl/sSo
 [license-url]: https://github.com/Hackerl/sSocks/blob/master/LICENSE
 [CMake]: https://img.shields.io/badge/CMake-000000?style=for-the-badge&logo=cmake&logoColor=FF3E00
 [CMake-url]: https://cmake.org
-[vcpkg]: https://img.shields.io/badge/vcpkg-000000?style=for-the-badge&logo=microsoft&logoColor=61DAFB
+[vcpkg]: https://img.shields.io/badge/vcpkg-000000?style=for-the-badge&logo=v&logoColor=61DAFB
 [vcpkg-url]: https://vcpkg.io
 [C++23]: https://img.shields.io/badge/C++23-000000?style=for-the-badge&logo=cplusplus&logoColor=4FC08D
 [C++23-url]: https://en.cppreference.com/w/cpp/23
