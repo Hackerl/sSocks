@@ -41,10 +41,24 @@ UDPToClient(const std::uint64_t id, asyncio::net::UDPSocket &remote, asyncio::IW
         const auto &[n, from] = co_await asyncio::error::guard(remote.readFrom(data));
         Z_LOG_DEBUG("[{}] UDP remote->client: {} bytes from {}", id, n, from);
 
-        if (std::holds_alternative<asyncio::net::IPv4Address>(from))
+        if (std::holds_alternative<asyncio::net::IPv4Address>(from)) {
             co_await writeTarget(local, std::get<asyncio::net::IPv4Address>(from));
-        else
-            co_await writeTarget(local, std::get<asyncio::net::IPv6Address>(from));
+        }
+        else {
+            const auto &address = std::get<asyncio::net::IPv6Address>(from);
+
+            // IPv4-mapped IPv6 (::ffff:x.x.x.x): normalize to IPv4
+            if (const auto &ip = address.ip;
+                ip[0] == std::byte{0} && ip[1] == std::byte{0} && ip[2] == std::byte{0} &&
+                ip[3] == std::byte{0} && ip[4] == std::byte{0} && ip[5] == std::byte{0} &&
+                ip[6] == std::byte{0} && ip[7] == std::byte{0} && ip[8] == std::byte{0} &&
+                ip[9] == std::byte{0} && ip[10] == std::byte{0xff} && ip[11] == std::byte{0xff}) {
+                co_await writeTarget(local, asyncio::net::IPv4Address{{ip[12], ip[13], ip[14], ip[15]}, address.port});
+            }
+            else {
+                co_await writeTarget(local, address);
+            }
+        }
 
         co_await asyncio::error::guard(asyncio::binary::writeBE(local, static_cast<std::uint32_t>(n)));
         co_await asyncio::error::guard(local.writeAll({data.data(), n}));
@@ -95,7 +109,7 @@ handle(const std::uint64_t id, asyncio::net::TCPStream stream, asyncio::net::tls
         co_return;
     }
     else if (static_cast<ProxyType>(type) == ProxyType::UDP) {
-        auto remote = co_await asyncio::error::guard(asyncio::net::UDPSocket::bind("0.0.0.0", 0));
+        auto remote = co_await asyncio::error::guard(asyncio::net::UDPSocket::bind("::", 0));
 
         const auto result = co_await asyncio::error::capture(
             race(
