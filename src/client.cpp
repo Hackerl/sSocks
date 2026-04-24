@@ -136,14 +136,14 @@ asyncio::task::Task<User> readUser(asyncio::IReader &reader) {
 }
 
 asyncio::task::Task<void>
-handshake(asyncio::net::TCPStream &stream, const std::optional<User> account) {
+handshake(asyncio::net::TCPStream &stream, const std::optional<User> user) {
     std::array<std::byte, 2> header{};
     co_await asyncio::error::guard(stream.readExactly(header));
 
     std::vector<std::byte> methods(std::to_integer<std::size_t>(header[1]));
     co_await asyncio::error::guard(stream.readExactly(methods));
 
-    if (!account) {
+    if (!user) {
         constexpr std::array response{std::byte{5}, std::byte{0}};
         co_await asyncio::error::guard(stream.writeAll(response));
         co_return;
@@ -161,7 +161,7 @@ handshake(asyncio::net::TCPStream &stream, const std::optional<User> account) {
     const auto [username, password] = co_await readUser(stream);
     Z_LOG_INFO("Authenticating user: {}", username);
 
-    if (username != account->username || password != account->password) {
+    if (username != user->username || password != user->password) {
         constexpr std::array result{std::byte{1}, std::byte{1}};
         co_await asyncio::error::guard(stream.writeAll(result));
         throw std::runtime_error{fmt::format("Authentication failed for user '{}'", username)};
