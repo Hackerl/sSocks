@@ -12,9 +12,13 @@ asyncio::task::Task<void>
 UDPToRemote(const std::uint64_t id, asyncio::IReader &local, asyncio::net::UDPSocket &remote) {
     while (true) {
         auto target = co_await readTarget(local);
+
+        if (!target)
+            break;
+
         const auto length = co_await asyncio::error::guard(asyncio::binary::readBE<std::uint32_t>(local));
 
-        Z_LOG_DEBUG("[{}] UDP client->remote: {} bytes to {}", id, length, target);
+        Z_LOG_DEBUG("[{}] UDP client->remote: {} bytes to {}", id, length, *target);
 
         std::vector<std::byte> payload(length);
         co_await asyncio::error::guard(local.readExactly(payload));
@@ -27,7 +31,7 @@ UDPToRemote(const std::uint64_t id, asyncio::IReader &local, asyncio::net::UDPSo
                     else
                         return remote.writeTo(payload, std::move(arg));
                 },
-                std::move(target)
+                *std::move(target)
             )
         );
     }
@@ -68,7 +72,11 @@ UDPToClient(const std::uint64_t id, asyncio::net::UDPSocket &remote, asyncio::IW
 asyncio::task::Task<void>
 proxyTCP(const std::uint64_t id, asyncio::net::tls::TLS<asyncio::net::TCPStream> local) {
     auto target = co_await readTarget(local);
-    Z_LOG_INFO("[{}] Connecting to {}", id, target);
+
+    if (!target)
+        throw std::runtime_error{"Client disconnected before sending target address"};
+
+    Z_LOG_INFO("[{}] Connecting to {}", id, *target);
 
     auto remote = co_await std::visit(
         []<typename T>(T arg) {
@@ -79,7 +87,7 @@ proxyTCP(const std::uint64_t id, asyncio::net::tls::TLS<asyncio::net::TCPStream>
                 return asyncio::net::TCPStream::connect(std::move(arg));
             }
         },
-        std::move(target)
+        *std::move(target)
     );
 
     if (!remote) {

@@ -28,11 +28,19 @@ struct HostAddress {
 
 using Target = std::variant<HostAddress, asyncio::net::IPv4Address, asyncio::net::IPv6Address>;
 
-inline asyncio::task::Task<Target> readTarget(asyncio::IReader &reader) {
-    const auto type = co_await asyncio::error::guard(asyncio::binary::readBE<std::int32_t>(reader));
+inline asyncio::task::Task<std::optional<Target>> readTarget(asyncio::IReader &reader) {
+    const auto type = co_await asyncio::binary::readBE<std::int32_t>(reader);
+
+    if (!type) {
+        if (const auto &error = type.error(); error != asyncio::IOError::UnexpectedEOF)
+            throw co_await asyncio::error::StacktraceError<std::system_error>::make(error);
+
+        co_return std::nullopt;
+    }
+
     const auto port = co_await asyncio::error::guard(asyncio::binary::readBE<std::uint16_t>(reader));
 
-    switch (static_cast<AddressType>(type)) {
+    switch (static_cast<AddressType>(*type)) {
     case AddressType::HOSTNAME: {
         const auto length = co_await asyncio::error::guard(asyncio::binary::readBE<std::size_t>(reader));
 

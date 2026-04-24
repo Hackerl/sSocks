@@ -231,7 +231,7 @@ setupUDP(
     const std::uint64_t id,
     asyncio::net::UDPSocket &local,
     asyncio::net::tls::TLS<asyncio::net::TCPStream> &remote,
-    const Target &source
+    const Target source
 ) {
     std::array<std::byte, 65535> data; // NOLINT(*-pro-type-member-init)
     const auto &[n, from] = co_await asyncio::error::guard(local.readFrom(data));
@@ -255,7 +255,7 @@ UDPToRemote(
     const std::uint64_t id,
     asyncio::net::UDPSocket &local,
     asyncio::IWriter &writer,
-    const asyncio::net::Address &client
+    const asyncio::net::Address client
 ) {
     while (true) {
         std::array<std::byte, 65535> data; // NOLINT(*-pro-type-member-init)
@@ -280,13 +280,17 @@ UDPToClient(
     const std::uint64_t id,
     asyncio::IReader &reader,
     asyncio::net::UDPSocket &local,
-    asyncio::net::Address client
+    const asyncio::net::Address client
 ) {
     while (true) {
         const auto target = co_await readTarget(reader);
+
+        if (!target)
+            throw std::runtime_error{"Server closed connection during UDP relay"};
+
         const auto length = co_await asyncio::error::guard(asyncio::binary::readBE<std::uint32_t>(reader));
 
-        Z_LOG_DEBUG("[{}] UDP remote->client: {} bytes from {}", id, length, target);
+        Z_LOG_DEBUG("[{}] UDP remote->client: {} bytes from {}", id, length, *target);
 
         std::vector<std::byte> payload(length);
         co_await asyncio::error::guard(reader.readExactly(payload));
@@ -296,10 +300,10 @@ UDPToClient(
             std::byte{0}
         };
 
-        if (std::holds_alternative<asyncio::net::IPv4Address>(target)) {
+        if (std::holds_alternative<asyncio::net::IPv4Address>(*target)) {
             response.push_back(std::byte{1});
 
-            const auto [ip, port] = std::get<asyncio::net::IPv4Address>(target);
+            const auto [ip, port] = std::get<asyncio::net::IPv4Address>(*target);
             const auto p = htons(port);
 
             response.append_range(ip);
@@ -312,7 +316,7 @@ UDPToClient(
 
         response.push_back(std::byte{4});
 
-        const auto &[ip, port, zone] = std::get<asyncio::net::IPv6Address>(target);
+        const auto &[ip, port, zone] = std::get<asyncio::net::IPv6Address>(*target);
         const auto p = htons(port);
 
         response.append_range(ip);
@@ -328,7 +332,7 @@ proxyUDP(
     const std::uint64_t id,
     asyncio::net::TCPStream stream,
     asyncio::net::tls::TLS<asyncio::net::TCPStream> remote,
-    const Target source
+    Target source
 ) {
     auto local = co_await asyncio::error::guard(
         std::visit(
@@ -372,7 +376,7 @@ proxyUDP(
     co_await asyncio::error::guard(stream.writeAll(response));
     co_await asyncio::error::guard(asyncio::binary::writeBE(remote, std::to_underlying(ProxyType::UDP)));
 
-    const auto client = co_await setupUDP(id, local, remote, source);
+    const auto client = co_await setupUDP(id, local, remote, std::move(source));
     Z_LOG_INFO("[{}] UDP client address: {}", id, client);
 
     co_await race(
