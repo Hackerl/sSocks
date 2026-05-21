@@ -29,11 +29,13 @@ bool matchSource(const Target &source, const asyncio::net::Address &from) {
                 return true;
             }
             else if constexpr (std::is_same_v<T, asyncio::net::IPv4Address>) {
-                if (!std::holds_alternative<asyncio::net::IPv4Address>(from))
+                const auto address = std::get_if<asyncio::net::IPv4Address>(&from);
+
+                if (!address)
                     return false;
 
                 const auto [sourceIP, sourcePort] = arg;
-                const auto [fromIP, fromPort] = std::get<asyncio::net::IPv4Address>(from);
+                const auto [fromIP, fromPort] = *address;
 
                 if (sourcePort != 0 && sourcePort != fromPort)
                     return false;
@@ -44,11 +46,13 @@ bool matchSource(const Target &source, const asyncio::net::Address &from) {
                 return sourceIP == fromIP;
             }
             else {
-                if (!std::holds_alternative<asyncio::net::IPv6Address>(from))
+                const auto address = std::get_if<asyncio::net::IPv6Address>(&from);
+
+                if (!address)
                     return false;
 
                 const auto &[sourceIP, sourcePort, sourceZone] = arg;
-                const auto &[fromIP, fromPort, fromZone] = std::get<asyncio::net::IPv6Address>(from);
+                const auto &[fromIP, fromPort, fromZone] = *address;
 
                 if (sourcePort != 0 && sourcePort != fromPort)
                     return false;
@@ -300,10 +304,10 @@ UDPToClient(
             std::byte{0}
         };
 
-        if (std::holds_alternative<asyncio::net::IPv4Address>(*target)) {
+        if (const auto address = std::get_if<asyncio::net::IPv4Address>(&*target)) {
             response.push_back(std::byte{1});
 
-            const auto [ip, port] = std::get<asyncio::net::IPv4Address>(*target);
+            const auto [ip, port] = *address;
             const auto p = htons(port);
 
             response.append_range(ip);
@@ -354,10 +358,10 @@ proxyUDP(
 
     std::vector response{std::byte{5}, std::byte{0}, std::byte{0}};
 
-    if (std::holds_alternative<asyncio::net::IPv4Address>(address)) {
+    if (const auto ipv4Address = std::get_if<asyncio::net::IPv4Address>(&address)) {
         response.push_back(std::byte{1});
 
-        const auto [ip, port] = std::get<asyncio::net::IPv4Address>(address);
+        const auto [ip, port] = *ipv4Address;
         const auto bindPort = htons(port);
 
         response.append_range(ip);

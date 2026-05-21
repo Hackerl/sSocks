@@ -45,8 +45,8 @@ UDPToClient(const std::uint64_t id, asyncio::net::UDPSocket &remote, asyncio::IW
         const auto &[n, from] = co_await asyncio::error::guard(remote.readFrom(data));
         Z_LOG_DEBUG("[{}] UDP remote->client: {} bytes from {}", id, n, from);
 
-        if (std::holds_alternative<asyncio::net::IPv4Address>(from)) {
-            co_await writeTarget(local, std::get<asyncio::net::IPv4Address>(from));
+        if (const auto ipv4Address = std::get_if<asyncio::net::IPv4Address>(&from)) {
+            co_await writeTarget(local, *ipv4Address);
         }
         else {
             const auto &address = std::get<asyncio::net::IPv6Address>(from);
