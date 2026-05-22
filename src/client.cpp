@@ -384,7 +384,7 @@ proxyUDP(
     Z_LOG_INFO("[{}] UDP client address: {}", id, client);
 
     co_await race(
-        asyncio::task::spawn([&]() -> asyncio::task::Task<void> {
+        asyncio::task::spawn([&] -> asyncio::task::Task<void> {
             while (true) {
                 std::array<std::byte, 1024> data; // NOLINT(*-pro-type-member-init)
 
@@ -542,7 +542,7 @@ asyncio::task::Task<void> asyncMain(const int argc, char *argv[]) {
             std::move(user),
             [
                 =, context = std::move(context)
-            ]() -> asyncio::task::Task<asyncio::net::tls::TLS<asyncio::net::TCPStream>> {
+            ] -> asyncio::task::Task<asyncio::net::tls::TLS<asyncio::net::TCPStream>> {
                 co_return co_await asyncio::error::guard(
                     asyncio::net::tls::connect(
                         co_await asyncio::error::guard(asyncio::net::TCPStream::connect(server, port)),
@@ -551,7 +551,7 @@ asyncio::task::Task<void> asyncMain(const int argc, char *argv[]) {
                 );
             }
         ),
-        asyncio::task::spawn([&]() -> asyncio::task::Task<void> {
+        asyncio::task::spawn([&] -> asyncio::task::Task<void> {
             co_await asyncio::error::guard(signal.on(SIGINT));
         })
     );

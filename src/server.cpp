@@ -199,7 +199,7 @@ asyncio::task::Task<void> asyncMain(const int argc, char *argv[]) {
 
     co_await race(
         serve(std::move(listener), std::move(context)),
-        asyncio::task::spawn([&]() -> asyncio::task::Task<void> {
+        asyncio::task::spawn([&] -> asyncio::task::Task<void> {
             co_await asyncio::error::guard(signal.on(SIGINT));
         })
     );
