@@ -9,27 +9,27 @@
 #include <zero/formatter.h>
 
 asyncio::task::Task<void>
-UDPToRemote(const std::uint64_t id, asyncio::IReader &local, asyncio::net::UDPSocket &remote) {
+UDPToRemote(const std::uint64_t id, asyncio::IReader &client, asyncio::net::UDPSocket &socket) {
     while (true) {
-        auto target = co_await readTarget(local);
+        auto target = co_await readEndpoint(client);
 
         if (!target)
             break;
 
-        const auto length = co_await asyncio::error::guard(asyncio::binary::readBE<std::uint32_t>(local));
+        const auto length = co_await asyncio::error::guard(asyncio::binary::readBE<std::uint32_t>(client));
 
         Z_LOG_DEBUG("[{}] UDP client->remote: {} bytes to {}", id, length, *target);
 
         std::vector<std::byte> payload(length);
-        co_await asyncio::error::guard(local.readExactly(payload));
+        co_await asyncio::error::guard(client.readExactly(payload));
 
         co_await asyncio::error::guard(
             std::visit(
                 [&]<typename T>(T arg) {
                     if constexpr (std::is_same_v<T, HostAddress>)
-                        return remote.writeTo(payload, std::move(arg.hostname), arg.port);
+                        return socket.writeTo(payload, std::move(arg.hostname), arg.port);
                     else
-                        return remote.writeTo(payload, std::move(arg));
+                        return socket.writeTo(payload, std::move(arg));
                 },
                 *std::move(target)
             )
@@ -38,15 +38,15 @@ UDPToRemote(const std::uint64_t id, asyncio::IReader &local, asyncio::net::UDPSo
 }
 
 asyncio::task::Task<void>
-UDPToClient(const std::uint64_t id, asyncio::net::UDPSocket &remote, asyncio::IWriter &local) {
+UDPToClient(const std::uint64_t id, asyncio::net::UDPSocket &socket, asyncio::IWriter &client) {
     while (true) {
         std::array<std::byte, 65535> data; // NOLINT(*-pro-type-member-init)
 
-        const auto &[n, from] = co_await asyncio::error::guard(remote.readFrom(data));
+        const auto &[n, from] = co_await asyncio::error::guard(socket.readFrom(data));
         Z_LOG_DEBUG("[{}] UDP remote->client: {} bytes from {}", id, n, from);
 
         if (const auto ipv4Address = std::get_if<asyncio::net::IPv4Address>(&from)) {
-            co_await writeTarget(local, *ipv4Address);
+            co_await writeEndpoint(client, *ipv4Address);
         }
         else {
             const auto &address = std::get<asyncio::net::IPv6Address>(from);
@@ -57,21 +57,21 @@ UDPToClient(const std::uint64_t id, asyncio::net::UDPSocket &remote, asyncio::IW
                 ip[3] == std::byte{0} && ip[4] == std::byte{0} && ip[5] == std::byte{0} &&
                 ip[6] == std::byte{0} && ip[7] == std::byte{0} && ip[8] == std::byte{0} &&
                 ip[9] == std::byte{0} && ip[10] == std::byte{0xff} && ip[11] == std::byte{0xff}) {
-                co_await writeTarget(local, asyncio::net::IPv4Address{{ip[12], ip[13], ip[14], ip[15]}, address.port});
+                co_await writeEndpoint(client, asyncio::net::IPv4Address{{ip[12], ip[13], ip[14], ip[15]}, address.port});
             }
             else {
-                co_await writeTarget(local, address);
+                co_await writeEndpoint(client, address);
             }
         }
 
-        co_await asyncio::error::guard(asyncio::binary::writeBE(local, static_cast<std::uint32_t>(n)));
-        co_await asyncio::error::guard(local.writeAll({data.data(), n}));
+        co_await asyncio::error::guard(asyncio::binary::writeBE(client, static_cast<std::uint32_t>(n)));
+        co_await asyncio::error::guard(client.writeAll({data.data(), n}));
     }
 }
 
 asyncio::task::Task<void>
 proxyTCP(const std::uint64_t id, asyncio::net::tls::TLS<asyncio::net::TCPStream> local) {
-    auto target = co_await readTarget(local);
+    auto target = co_await readEndpoint(local);
 
     if (!target)
         throw std::runtime_error{"Client disconnected before sending target address"};
@@ -117,12 +117,12 @@ handle(const std::uint64_t id, asyncio::net::TCPStream stream, asyncio::net::tls
         co_return;
     }
     else if (static_cast<ProxyType>(type) == ProxyType::UDP) {
-        auto remote = co_await asyncio::error::guard(asyncio::net::UDPSocket::bind("::", 0));
+        auto socket = co_await asyncio::error::guard(asyncio::net::UDPSocket::bind("::", 0));
 
         const auto result = co_await asyncio::error::capture(
             race(
-                UDPToRemote(id, tls, remote),
-                UDPToClient(id, remote, tls)
+                UDPToRemote(id, tls, socket),
+                UDPToClient(id, socket, tls)
             )
         );
 

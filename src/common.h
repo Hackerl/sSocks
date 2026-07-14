@@ -26,9 +26,9 @@ struct HostAddress {
     std::string hostname;
 };
 
-using Target = std::variant<HostAddress, asyncio::net::IPv4Address, asyncio::net::IPv6Address>;
+using Endpoint = std::variant<HostAddress, asyncio::net::IPv4Address, asyncio::net::IPv6Address>;
 
-inline asyncio::task::Task<std::optional<Target>> readTarget(asyncio::IReader &reader) {
+inline asyncio::task::Task<std::optional<Endpoint>> readEndpoint(asyncio::IReader &reader) {
     const auto type = co_await asyncio::binary::readBE<std::int32_t>(reader);
 
     if (!type) {
@@ -68,7 +68,7 @@ inline asyncio::task::Task<std::optional<Target>> readTarget(asyncio::IReader &r
     }
 }
 
-inline asyncio::task::Task<void> writeTarget(asyncio::IWriter &writer, Target target) {
+inline asyncio::task::Task<void> writeEndpoint(asyncio::IWriter &writer, Endpoint endpoint) {
     co_await std::visit(
         [&]<typename T>(T arg) -> asyncio::task::Task<void> {
             if constexpr (std::is_same_v<T, HostAddress>) {
@@ -96,7 +96,7 @@ inline asyncio::task::Task<void> writeTarget(asyncio::IWriter &writer, Target ta
                 co_await asyncio::error::guard(writer.writeAll(ip));
             }
         },
-        std::move(target)
+        std::move(endpoint)
     );
 }
 
