@@ -449,6 +449,8 @@ namespace {
             co_await asyncio::error::guard(stream.remoteAddress())
         );
 
+        co_await asyncio::error::guard(stream.keepalive(true, DefaultTCPKeepAliveDelay));
+
         co_await handshake(stream, std::move(user));
 
         auto request = co_await readRequest(stream);
@@ -553,12 +555,9 @@ asyncio::task::Task<void> asyncMain(const int argc, char *argv[]) {
             [
                 =, context = std::move(context)
             ] -> asyncio::task::Task<asyncio::net::tls::TLS<asyncio::net::TCPStream>> {
-                co_return co_await asyncio::error::guard(
-                    asyncio::net::tls::connect(
-                        co_await asyncio::error::guard(asyncio::net::TCPStream::connect(server, port)),
-                        context
-                    )
-                );
+                auto stream = co_await asyncio::error::guard(asyncio::net::TCPStream::connect(server, port));
+                co_await asyncio::error::guard(stream.keepalive(true, DefaultTCPKeepAliveDelay));
+                co_return co_await asyncio::error::guard(asyncio::net::tls::connect(std::move(stream), context));
             }
         ),
         asyncio::task::spawn([&] -> asyncio::task::Task<void> {

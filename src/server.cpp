@@ -99,6 +99,7 @@ namespace {
             throw co_await asyncio::error::StacktraceError<std::system_error>::make(remote.error());
         }
 
+        co_await asyncio::error::guard(remote->keepalive(true, DefaultTCPKeepAliveDelay));
         co_await asyncio::error::guard(asyncio::binary::writeBE(local, std::to_underlying(ProxyStatus::SUCCESS)));
         co_await asyncio::error::guard(asyncio::net::copyBidirectional(local, *remote));
     }
@@ -112,6 +113,8 @@ namespace {
             co_await asyncio::error::guard(stream.localAddress()),
             co_await asyncio::error::guard(stream.remoteAddress())
         );
+
+        co_await asyncio::error::guard(stream.keepalive(true, DefaultTCPKeepAliveDelay));
 
         auto tls = co_await asyncio::error::guard(asyncio::net::tls::accept(std::move(stream), std::move(context)));
 

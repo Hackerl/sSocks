@@ -5,6 +5,8 @@
 #include <asyncio/error.h>
 #include <asyncio/net/net.h>
 
+inline constexpr auto DefaultTCPKeepAliveDelay = std::chrono::seconds{60};
+
 enum class ProxyType : std::int32_t {
     TCP,
     UDP
