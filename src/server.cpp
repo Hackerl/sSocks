@@ -8,161 +8,167 @@
 #include <zero/cmdline.h>
 #include <zero/formatter.h>
 
-asyncio::task::Task<void>
-UDPToRemote(const std::uint64_t id, asyncio::IReader &client, asyncio::net::UDPSocket &socket) {
-    while (true) {
-        auto target = co_await readEndpoint(client);
+namespace {
+    asyncio::task::Task<void>
+    UDPToRemote(const std::uint64_t id, asyncio::IReader &client, asyncio::net::UDPSocket &socket) {
+        while (true) {
+            auto target = co_await readEndpoint(client);
+
+            if (!target)
+                break;
+
+            const auto length = co_await asyncio::error::guard(asyncio::binary::readBE<std::uint32_t>(client));
+
+            Z_LOG_DEBUG("[{}] UDP client->remote: {} bytes to {}", id, length, *target);
+
+            std::vector<std::byte> payload(length);
+            co_await asyncio::error::guard(client.readExactly(payload));
+
+            co_await asyncio::error::guard(
+                std::visit(
+                    [&]<typename T>(T arg) {
+                        if constexpr (std::is_same_v<T, HostAddress>)
+                            return socket.writeTo(payload, std::move(arg.hostname), arg.port);
+                        else
+                            return socket.writeTo(payload, std::move(arg));
+                    },
+                    *std::move(target)
+                )
+            );
+        }
+    }
+
+    asyncio::task::Task<void>
+    UDPToClient(const std::uint64_t id, asyncio::net::UDPSocket &socket, asyncio::IWriter &client) {
+        while (true) {
+            std::array<std::byte, 65535> data; // NOLINT(*-pro-type-member-init)
+
+            const auto &[n, from] = co_await asyncio::error::guard(socket.readFrom(data));
+            Z_LOG_DEBUG("[{}] UDP remote->client: {} bytes from {}", id, n, from);
+
+            if (const auto ipv4Address = std::get_if<asyncio::net::IPv4Address>(&from)) {
+                co_await writeEndpoint(client, *ipv4Address);
+            }
+            else {
+                const auto &address = std::get<asyncio::net::IPv6Address>(from);
+
+                // IPv4-mapped IPv6 (::ffff:x.x.x.x): normalize to IPv4
+                if (const auto &ip = address.ip;
+                    ip[0] == std::byte{0} && ip[1] == std::byte{0} && ip[2] == std::byte{0} &&
+                    ip[3] == std::byte{0} && ip[4] == std::byte{0} && ip[5] == std::byte{0} &&
+                    ip[6] == std::byte{0} && ip[7] == std::byte{0} && ip[8] == std::byte{0} &&
+                    ip[9] == std::byte{0} && ip[10] == std::byte{0xff} && ip[11] == std::byte{0xff}) {
+                    co_await writeEndpoint(client,
+                                           asyncio::net::IPv4Address{
+                                               .ip = {ip[12], ip[13], ip[14], ip[15]}, .port = address.port
+                                           });
+                }
+                else {
+                    co_await writeEndpoint(client, address);
+                }
+            }
+
+            co_await asyncio::error::guard(asyncio::binary::writeBE(client, static_cast<std::uint32_t>(n)));
+            co_await asyncio::error::guard(client.writeAll({data.data(), n}));
+        }
+    }
+
+    asyncio::task::Task<void>
+    proxyTCP(const std::uint64_t id, asyncio::net::tls::TLS<asyncio::net::TCPStream> local) {
+        auto target = co_await readEndpoint(local);
 
         if (!target)
-            break;
+            throw std::runtime_error{"Client disconnected before sending target address"};
 
-        const auto length = co_await asyncio::error::guard(asyncio::binary::readBE<std::uint32_t>(client));
+        Z_LOG_INFO("[{}] Connecting to {}", id, *target);
 
-        Z_LOG_DEBUG("[{}] UDP client->remote: {} bytes to {}", id, length, *target);
-
-        std::vector<std::byte> payload(length);
-        co_await asyncio::error::guard(client.readExactly(payload));
-
-        co_await asyncio::error::guard(
-            std::visit(
-                [&]<typename T>(T arg) {
-                    if constexpr (std::is_same_v<T, HostAddress>)
-                        return socket.writeTo(payload, std::move(arg.hostname), arg.port);
-                    else
-                        return socket.writeTo(payload, std::move(arg));
-                },
-                *std::move(target)
-            )
+        auto remote = co_await std::visit(
+            []<typename T>(T arg) {
+                if constexpr (std::is_same_v<T, HostAddress>) {
+                    return asyncio::net::TCPStream::connect(std::move(arg.hostname), arg.port);
+                }
+                else {
+                    return asyncio::net::TCPStream::connect(std::move(arg));
+                }
+            },
+            *std::move(target)
         );
+
+        if (!remote) {
+            co_await asyncio::error::guard(asyncio::binary::writeBE(local, std::to_underlying(ProxyStatus::FAIL)));
+            throw co_await asyncio::error::StacktraceError<std::system_error>::make(remote.error());
+        }
+
+        co_await asyncio::error::guard(asyncio::binary::writeBE(local, std::to_underlying(ProxyStatus::SUCCESS)));
+        co_await asyncio::error::guard(asyncio::net::copyBidirectional(local, *remote));
     }
-}
 
-asyncio::task::Task<void>
-UDPToClient(const std::uint64_t id, asyncio::net::UDPSocket &socket, asyncio::IWriter &client) {
-    while (true) {
-        std::array<std::byte, 65535> data; // NOLINT(*-pro-type-member-init)
+    asyncio::task::Task<void>
+    handle(const std::uint64_t id, asyncio::net::TCPStream stream, asyncio::net::tls::Context context) {
+        Z_LOG_INFO(
+            "[{}] New session: fd={} local={} peer={}",
+            id,
+            stream.fd(),
+            co_await asyncio::error::guard(stream.localAddress()),
+            co_await asyncio::error::guard(stream.remoteAddress())
+        );
 
-        const auto &[n, from] = co_await asyncio::error::guard(socket.readFrom(data));
-        Z_LOG_DEBUG("[{}] UDP remote->client: {} bytes from {}", id, n, from);
+        auto tls = co_await asyncio::error::guard(asyncio::net::tls::accept(std::move(stream), std::move(context)));
 
-        if (const auto ipv4Address = std::get_if<asyncio::net::IPv4Address>(&from)) {
-            co_await writeEndpoint(client, *ipv4Address);
+        if (const auto type = co_await asyncio::error::guard(asyncio::binary::readBE<std::int32_t>(tls));
+            static_cast<ProxyType>(type) == ProxyType::TCP) {
+            co_await proxyTCP(id, std::move(tls));
+            co_return;
+        }
+        else if (static_cast<ProxyType>(type) == ProxyType::UDP) {
+            auto socket = co_await asyncio::error::guard(asyncio::net::UDPSocket::bind("::", 0));
+
+            const auto result = co_await asyncio::error::capture(
+                race(
+                    UDPToRemote(id, tls, socket),
+                    UDPToClient(id, socket, tls)
+                )
+            );
+
+            co_await asyncio::error::guard(tls.close());
+
+            if (!result)
+                std::rethrow_exception(result.error());
         }
         else {
-            const auto &address = std::get<asyncio::net::IPv6Address>(from);
+            throw std::runtime_error{fmt::format("Unknown proxy type: {}", type)};
+        }
+    }
 
-            // IPv4-mapped IPv6 (::ffff:x.x.x.x): normalize to IPv4
-            if (const auto &ip = address.ip;
-                ip[0] == std::byte{0} && ip[1] == std::byte{0} && ip[2] == std::byte{0} &&
-                ip[3] == std::byte{0} && ip[4] == std::byte{0} && ip[5] == std::byte{0} &&
-                ip[6] == std::byte{0} && ip[7] == std::byte{0} && ip[8] == std::byte{0} &&
-                ip[9] == std::byte{0} && ip[10] == std::byte{0xff} && ip[11] == std::byte{0xff}) {
-                co_await writeEndpoint(client, asyncio::net::IPv4Address{{ip[12], ip[13], ip[14], ip[15]}, address.port});
+    asyncio::task::Task<void> serve(asyncio::net::TCPListener listener, const asyncio::net::tls::Context context) {
+        std::expected<void, std::error_code> result;
+        asyncio::task::TaskGroup group;
+
+        while (true) {
+            auto stream = co_await listener.accept();
+
+            if (!stream) {
+                result = std::unexpected{stream.error()};
+                break;
             }
-            else {
-                co_await writeEndpoint(client, address);
-            }
+
+            static std::uint64_t counter;
+            const auto id = counter++;
+
+            auto task = handle(id, *std::move(stream), context);
+            group.add(task);
+
+            task.future().fail([=](const auto &e) {
+                Z_LOG_ERROR("[{}] Session error: {}", id, e);
+            });
         }
 
-        co_await asyncio::error::guard(asyncio::binary::writeBE(client, static_cast<std::uint32_t>(n)));
-        co_await asyncio::error::guard(client.writeAll({data.data(), n}));
+        co_await group;
+        co_await asyncio::error::guard(std::move(result));
     }
 }
 
-asyncio::task::Task<void>
-proxyTCP(const std::uint64_t id, asyncio::net::tls::TLS<asyncio::net::TCPStream> local) {
-    auto target = co_await readEndpoint(local);
-
-    if (!target)
-        throw std::runtime_error{"Client disconnected before sending target address"};
-
-    Z_LOG_INFO("[{}] Connecting to {}", id, *target);
-
-    auto remote = co_await std::visit(
-        []<typename T>(T arg) {
-            if constexpr (std::is_same_v<T, HostAddress>) {
-                return asyncio::net::TCPStream::connect(std::move(arg.hostname), arg.port);
-            }
-            else {
-                return asyncio::net::TCPStream::connect(std::move(arg));
-            }
-        },
-        *std::move(target)
-    );
-
-    if (!remote) {
-        co_await asyncio::error::guard(asyncio::binary::writeBE(local, std::to_underlying(ProxyStatus::FAIL)));
-        throw co_await asyncio::error::StacktraceError<std::system_error>::make(remote.error());
-    }
-
-    co_await asyncio::error::guard(asyncio::binary::writeBE(local, std::to_underlying(ProxyStatus::SUCCESS)));
-    co_await asyncio::error::guard(asyncio::net::copyBidirectional(local, *remote));
-}
-
-asyncio::task::Task<void>
-handle(const std::uint64_t id, asyncio::net::TCPStream stream, asyncio::net::tls::Context context) {
-    Z_LOG_INFO(
-        "[{}] New session: fd={} local={} peer={}",
-        id,
-        stream.fd(),
-        co_await asyncio::error::guard(stream.localAddress()),
-        co_await asyncio::error::guard(stream.remoteAddress())
-    );
-
-    auto tls = co_await asyncio::error::guard(asyncio::net::tls::accept(std::move(stream), std::move(context)));
-
-    if (const auto type = co_await asyncio::error::guard(asyncio::binary::readBE<std::int32_t>(tls));
-        static_cast<ProxyType>(type) == ProxyType::TCP) {
-        co_await proxyTCP(id, std::move(tls));
-        co_return;
-    }
-    else if (static_cast<ProxyType>(type) == ProxyType::UDP) {
-        auto socket = co_await asyncio::error::guard(asyncio::net::UDPSocket::bind("::", 0));
-
-        const auto result = co_await asyncio::error::capture(
-            race(
-                UDPToRemote(id, tls, socket),
-                UDPToClient(id, socket, tls)
-            )
-        );
-
-        co_await asyncio::error::guard(tls.close());
-
-        if (!result)
-            std::rethrow_exception(result.error());
-    }
-    else {
-        throw std::runtime_error{fmt::format("Unknown proxy type: {}", type)};
-    }
-}
-
-asyncio::task::Task<void> serve(asyncio::net::TCPListener listener, const asyncio::net::tls::Context context) {
-    std::expected<void, std::error_code> result;
-    asyncio::task::TaskGroup group;
-
-    while (true) {
-        auto stream = co_await listener.accept();
-
-        if (!stream) {
-            result = std::unexpected{stream.error()};
-            break;
-        }
-
-        static std::uint64_t counter;
-        const auto id = counter++;
-
-        auto task = handle(id, *std::move(stream), context);
-        group.add(task);
-
-        task.future().fail([=](const auto &e) {
-            Z_LOG_ERROR("[{}] Session error: {}", id, e);
-        });
-    }
-
-    co_await group;
-    co_await asyncio::error::guard(std::move(result));
-}
-
+// ReSharper disable once CppUseInternalLinkage
 asyncio::task::Task<void> asyncMain(const int argc, char *argv[]) {
     Z_INIT_CONSOLE_LOG(zero::log::Level::Info);
 
@@ -190,7 +196,7 @@ asyncio::task::Task<void> asyncMain(const int argc, char *argv[]) {
     auto context = co_await asyncio::error::guard(
         asyncio::net::tls::ServerConfig{}
         .rootCAs({std::move(ca)})
-        .certKeyPairs({{std::move(cert), std::move(key)}})
+        .certKeyPairs({{.cert = std::move(cert), .key = std::move(key)}})
         .build()
     );
 

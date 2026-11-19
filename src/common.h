@@ -48,19 +48,19 @@ inline asyncio::task::Task<std::optional<Endpoint>> readEndpoint(asyncio::IReade
         hostname.resize(length);
 
         co_await asyncio::error::guard(reader.readExactly(std::as_writable_bytes(std::span{hostname})));
-        co_return HostAddress{port, std::move(hostname)};
+        co_return HostAddress{.port = port, .hostname = std::move(hostname)};
     }
 
     case AddressType::IPV4: {
         std::array<std::byte, 4> ip{};
         co_await asyncio::error::guard(reader.readExactly(ip));
-        co_return asyncio::net::IPv4Address{ip, port};
+        co_return asyncio::net::IPv4Address{.ip = ip, .port = port};
     }
 
     case AddressType::IPV6: {
         std::array<std::byte, 16> ip{};
         co_await asyncio::error::guard(reader.readExactly(ip));
-        co_return asyncio::net::IPv6Address{ip, port};
+        co_return asyncio::net::IPv6Address{.ip = ip, .port = port};
     }
 
     default:
