@@ -2,7 +2,7 @@ name: sSocks
 on: [ push ]
 jobs:
   linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -33,7 +33,7 @@ jobs:
           CXXFLAGS: -stdlib=libc++
 
   linux-static:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v5
